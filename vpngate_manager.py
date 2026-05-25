@@ -1,0 +1,1932 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import base64
+import csv
+import json
+import os
+import queue
+import re
+import select
+import shlex
+import socket
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+import concurrent.futures
+import sys
+
+import vpn_utils
+import proxy_server
+
+API_URL = "https://www.vpngate.net/api/iphone/"
+FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "600"))
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "600"))
+TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
+MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
+OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
+OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
+OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
+OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
+LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
+LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
+UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
+UI_PORT = int(os.environ.get("UI_PORT", "8787"))
+INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
+
+ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+CONFIG_DIR = DATA_DIR / "configs"
+NODES_FILE = DATA_DIR / "nodes.json"
+STATE_FILE = DATA_DIR / "state.json"
+BLACKLIST_FILE = DATA_DIR / "invalid_nodes.json"
+AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
+
+lock = threading.RLock()
+active_openvpn_process: subprocess.Popen[str] | None = None
+active_openvpn_node_id = ""
+
+def ensure_dirs() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    CONFIG_DIR.mkdir(exist_ok=True)
+    if not AUTH_FILE.exists():
+        AUTH_FILE.write_text(f"{OPENVPN_AUTH_USER}\n{OPENVPN_AUTH_PASS}\n", encoding="utf-8")
+        try:
+            AUTH_FILE.chmod(0o600)
+        except OSError:
+            pass
+
+def write_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+def set_state(**updates: Any) -> None:
+    state = get_state()
+    state.update(updates)
+    write_json(STATE_FILE, state)
+
+def get_state() -> dict[str, Any]:
+    state = read_json(STATE_FILE, {})
+    state.setdefault("api_url", API_URL)
+    state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
+    state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
+    state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
+    state.setdefault("local_proxy", f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}")
+    state.setdefault("active_openvpn_node_id", active_openvpn_node_id)
+    state.setdefault("last_fetch_status", "not_started")
+    state.setdefault("last_check_message", "")
+    state.setdefault("blacklisted_nodes", len(load_blacklist()))
+    return state
+
+def safe_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return value.strip("._") or "node"
+
+def parse_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+def fetch_api_text() -> str:
+    request = urllib.request.Request(
+        API_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 vpngate-openvpn-manager/2.0",
+            "Accept": "text/plain,*/*",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
+    lines = [line for line in text.splitlines() if line and not line.startswith("*")]
+    if lines and lines[0].startswith("#"):
+        lines[0] = lines[0][1:]
+    return list(csv.DictReader(lines))
+
+def decode_config(encoded: str) -> str:
+    return base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8", errors="replace")
+
+def load_blacklist() -> dict[str, dict[str, Any]]:
+    now = time.time()
+    raw = read_json(BLACKLIST_FILE, {})
+    fresh = {
+        str(node_id): item
+        for node_id, item in raw.items()
+        if now - float(item.get("failed_at", 0)) < INVALID_BACKOFF_SECONDS
+    }
+    if fresh != raw:
+        write_json(BLACKLIST_FILE, fresh)
+    return fresh
+
+def mark_blacklisted(node: dict[str, Any], message: str) -> None:
+    with lock:
+        blacklist = load_blacklist()
+        blacklist[str(node["id"])] = {
+            "failed_at": time.time(),
+            "message": message,
+            "remote": f"{node.get('remote_host')}:{node.get('remote_port')}",
+        }
+        write_json(BLACKLIST_FILE, blacklist)
+
+def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
+    ip = row.get("IP", "")
+    country_short = row.get("CountryShort", "")
+    remote_host, remote_port, proto = vpn_utils.parse_remote(config_text, ip)
+    node_id = safe_name("_".join([country_short or "XX", ip or remote_host, str(remote_port), proto]))
+    config_path = CONFIG_DIR / f"{node_id}.ovpn"
+    
+    country_long = row.get("CountryLong", "")
+    country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, vpn_utils.COUNTRY_TRANSLATIONS.get(country_long.strip(), country_long))
+    return {
+        "id": node_id,
+        "country": country_zh,
+        "country_short": country_short,
+        "host_name": row.get("HostName", ""),
+        "ip": ip,
+        "score": parse_int(row.get("Score")),
+        "ping": parse_int(row.get("Ping")),
+        "speed": parse_int(row.get("Speed")),
+        "sessions": parse_int(row.get("NumVpnSessions")),
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "latency_ms": 0,
+        "config_file": str(config_path),
+        "config_text": config_text,
+        "proto": proto,
+        "remote_host": remote_host,
+        "remote_port": remote_port,
+        "fetched_at": time.time(),
+        "probe_status": "not_checked",
+        "probe_message": "",
+        "probed_at": 0,
+    }
+
+def fetch_candidates() -> list[dict[str, Any]]:
+    blacklist = load_blacklist()
+    candidates: list[dict[str, Any]] = []
+    seen_ips = set()
+    
+    for i in range(3):
+        if i > 0:
+            time.sleep(1.5)
+        try:
+            api_text = fetch_api_text()
+            rows = parse_vpngate_rows(api_text)
+            for row in rows[:MAX_SCAN_ROWS]:
+                ip = row.get("IP", "")
+                if not ip or ip in seen_ips:
+                    continue
+                encoded = row.get("OpenVPN_ConfigData_Base64", "")
+                if not encoded:
+                    continue
+                config_text = decode_config(encoded)
+                node = row_to_node(row, config_text)
+                candidates.append(node)
+                seen_ips.add(ip)
+        except Exception as e:
+            print(f"[fetch_candidates] Fetch {i+1} failed: {e}", flush=True)
+            if i == 0 and not candidates:
+                raise
+                
+    set_state(
+        last_fetch_at=time.time(),
+        last_fetch_status="ok",
+        last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
+        blacklisted_nodes=len(blacklist),
+    )
+    return candidates
+
+def cached_nodes() -> list[dict[str, Any]]:
+    return read_json(NODES_FILE, [])
+
+_openvpn_version = None
+
+def get_openvpn_version() -> float:
+    global _openvpn_version
+    if _openvpn_version is not None:
+        return _openvpn_version
+    try:
+        cmd = shlex.split(OPENVPN_CMD, posix=False) or ["openvpn"]
+        res = subprocess.run([cmd[0], "--version"], capture_output=True, text=True, timeout=2)
+        match = re.search(r"OpenVPN\s+(\d+\.\d+)", res.stdout or res.stderr)
+        if match:
+            _openvpn_version = float(match.group(1))
+            return _openvpn_version
+    except Exception:
+        pass
+    _openvpn_version = 2.4
+    return _openvpn_version
+
+def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> list[str]:
+    command = shlex.split(OPENVPN_CMD, posix=False) or ["openvpn"]
+    command.extend(
+        [
+            "--config",
+            config_file,
+            "--dev",
+            dev,
+            "--dev-type",
+            "tun",
+            "--pull-filter",
+            "ignore",
+            "route-ipv6",
+            "--pull-filter",
+            "ignore",
+            "ifconfig-ipv6",
+            "--route-delay",
+            "2",
+            "--connect-retry-max",
+            "1",
+            "--connect-timeout",
+            "15",
+            "--auth-user-pass",
+            str(AUTH_FILE),
+            "--auth-nocache",
+        ]
+    )
+    
+    version = get_openvpn_version()
+    if version >= 2.5:
+        command.extend(["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
+    else:
+        command.extend(["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
+
+    command.extend(["--verb", "3"])
+    
+    try:
+        content = Path(config_file).read_text(encoding="utf-8", errors="replace")
+        if vpn_utils.is_config_tcp(content):
+            ptype, host, port = vpn_utils.get_upstream_proxy()
+            if ptype == "socks" and host and port:
+                command.extend(["--socks-proxy", host, str(port)])
+            elif ptype == "http" and host and port:
+                command.extend(["--http-proxy", host, str(port)])
+    except Exception:
+        pass
+        
+    if route_nopull:
+        command.append("--route-nopull")
+    return command
+
+def stop_process(process: subprocess.Popen[str] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
+    limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
+    try:
+        process = subprocess.Popen(
+            openvpn_command(config_file, route_nopull, dev),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(ROOT_DIR),
+        )
+    except FileNotFoundError:
+        return False, "openvpn command not found", None
+    except OSError as exc:
+        return False, f"openvpn start failed: {exc}", None
+
+    lines: queue.Queue[str | None] = queue.Queue()
+    startup_done = [False]
+
+    def reader() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if not startup_done[0]:
+                lines.put(line.rstrip())
+            else:
+                if keep_alive:
+                    print(f"[OpenVPN] {line.rstrip()}", flush=True)
+        if not startup_done[0]:
+            lines.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    started = time.time()
+    tail: list[str] = []
+    ok = False
+    message = "OpenVPN did not complete initialization."
+    while time.time() - started < limit:
+        try:
+            line = lines.get(timeout=0.5)
+        except queue.Empty:
+            if process.poll() is not None:
+                break
+            continue
+        if line is None:
+            break
+        if line:
+            tail.append(line)
+            tail = tail[-8:]
+            if keep_alive:
+                print(f"[OpenVPN] {line}", flush=True)
+        lower = line.lower()
+        if "initialization sequence completed" in lower:
+            ok = True
+            message = f"OpenVPN connected in {int((time.time() - started) * 1000)} ms."
+            break
+        if "auth_failed" in lower or "authentication failed" in lower:
+            message = "AUTH_FAILED"
+            break
+        if "cannot ioctl" in lower or "fatal error" in lower:
+            message = line[-220:]
+            break
+    else:
+        message = f"OpenVPN timeout after {limit}s."
+
+    if not ok and tail:
+        message = tail[-1][-220:]
+    startup_done[0] = True
+    if not keep_alive or not ok:
+        stop_process(process)
+        process = None
+    return ok, message, process
+
+def setup_policy_routing(interface: str = "tun0") -> None:
+    try:
+        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+    except Exception:
+        pass
+    
+    success = False
+    for attempt in range(1, 4):
+        try:
+            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
+            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
+            success = True
+            break
+        except Exception as e:
+            print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
+            time.sleep(1)
+            
+    if not success:
+        print("[policy_routing] Failed to enable policy routing after 3 attempts", flush=True)
+
+def cleanup_policy_routing() -> None:
+    try:
+        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+        print("[policy_routing] Cleared policy routing table 100", flush=True)
+    except Exception:
+        pass
+
+def stop_active_openvpn() -> None:
+    global active_openvpn_process, active_openvpn_node_id
+    cleanup_policy_routing()
+    config_to_delete = None
+    if active_openvpn_node_id:
+        nodes = read_json(NODES_FILE, [])
+        node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
+        if node:
+            config_to_delete = node.get("config_file")
+            
+    stop_process(active_openvpn_process)
+    active_openvpn_process = None
+    active_openvpn_node_id = ""
+    
+    if config_to_delete:
+        try:
+            path = Path(config_to_delete)
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+def active_openvpn_running() -> bool:
+    return active_openvpn_process is not None and active_openvpn_process.poll() is None
+
+def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    active_nodes = [n for n in nodes if n.get("active")]
+    available_nodes = sorted(
+        [n for n in nodes if not n.get("active") and n.get("probe_status") == "available"],
+        key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score")))
+    )
+    untested_nodes = sorted(
+        [n for n in nodes if not n.get("active") and n.get("probe_status") == "not_checked"],
+        key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping")))
+    )
+    unavailable_nodes = sorted(
+        [n for n in nodes if not n.get("active") and n.get("probe_status") == "unavailable"],
+        key=lambda n: (-parse_int(n.get("score")), -float(n.get("probed_at", 0)))
+    )
+    return active_nodes + available_nodes + untested_nodes + unavailable_nodes
+
+def test_node_by_id(node_id: str) -> dict[str, Any]:
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if not node:
+            raise ValueError(f"Node not found: {node_id}")
+        config_file = str(node["config_file"])
+        config_text = node.get("config_text") or ""
+        h = str(node.get("remote_host") or node.get("ip"))
+        p = parse_int(node.get("remote_port"))
+        fallback_ping = parse_int(node.get("ping"))
+
+    temp_path = Path(config_file)
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        temp_path.write_text(config_text, encoding="utf-8")
+    except Exception as e:
+        raise RuntimeError(f"Failed to write temp config file: {e}")
+
+    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+    ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev="tun")
+    
+    try:
+        if temp_path.exists():
+            temp_path.unlink()
+    except Exception:
+        pass
+
+    temp_node = {
+        "id": node_id,
+        "ip": h,
+        "remote_host": h,
+        "remote_port": p,
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+    }
+    if ok:
+        vpn_utils.enrich_ip_info([temp_node])
+    else:
+        mark_blacklisted(temp_node, message)
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if node:
+            node["latency_ms"] = latency
+            node["probe_status"] = "available" if ok else "unavailable"
+            node["probe_message"] = message
+            node["probed_at"] = time.time()
+            if ok:
+                node["owner"] = temp_node["owner"]
+                node["asn"] = temp_node["asn"]
+                node["as_name"] = temp_node["as_name"]
+                node["location"] = temp_node["location"]
+                node["ip_type"] = temp_node["ip_type"]
+                node["quality"] = temp_node["quality"]
+            
+            sorted_nodes = sort_all_nodes(nodes)
+            write_json(NODES_FILE, sorted_nodes)
+            res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
+            return res
+        else:
+            return {}
+
+def connect_node(node_id: str) -> str:
+    global active_openvpn_process, active_openvpn_node_id
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if not node:
+            raise ValueError(f"Node not found: {node_id}")
+        stop_active_openvpn()
+
+        config_path = Path(node["config_file"])
+        try:
+            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+            config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+        except Exception as e:
+            raise RuntimeError(f"Failed to write configuration: {e}")
+
+        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
+        if not ok or process is None:
+            try:
+                if config_path.exists():
+                    config_path.unlink()
+            except Exception:
+                pass
+            node["probe_status"] = "unavailable"
+            node["probe_message"] = message
+            mark_blacklisted(node, message)
+            for item in nodes:
+                item["active"] = False
+            write_json(NODES_FILE, nodes)
+            raise RuntimeError(message)
+            
+        active_openvpn_process = process
+        active_openvpn_node_id = node_id
+        setup_policy_routing("tun0")
+        for item in nodes:
+            item["active"] = item.get("id") == node_id
+            if item["active"]:
+                item["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
+        write_json(NODES_FILE, nodes)
+        set_state(active_openvpn_node_id=node_id, last_check_message=f"Connected {node_id}")
+        return f"Connected {node_id}"
+
+def maintain_valid_nodes(force: bool = False) -> str:
+    global active_openvpn_process, active_openvpn_node_id
+    ensure_dirs()
+    if force:
+        write_json(BLACKLIST_FILE, {})
+        with lock:
+            stop_active_openvpn()
+    elif not active_openvpn_running():
+        with lock:
+            stop_active_openvpn()
+
+    try:
+        candidates = fetch_candidates()
+    except Exception as exc:
+        vpn_utils.check_and_fix_dns()
+        try:
+            candidates = fetch_candidates()
+        except Exception as exc2:
+            set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=str(exc2))
+            candidates = []
+
+    with lock:
+        cached = read_json(NODES_FILE, [])
+        cached_by_id = {n["id"]: n for n in cached}
+
+        merged: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        for cand in candidates:
+            node_id = cand["id"]
+            if node_id in seen_ids:
+                continue
+            seen_ids.add(node_id)
+            if node_id in cached_by_id:
+                old = cached_by_id[node_id]
+                old.update({
+                    "score": cand["score"],
+                    "ping": cand["ping"],
+                    "speed": cand["speed"],
+                    "sessions": cand["sessions"],
+                    "config_text": cand["config_text"]
+                })
+                merged.append(old)
+            else:
+                merged.append(cand)
+
+        if active_openvpn_node_id and active_openvpn_node_id not in seen_ids:
+            active_node = cached_by_id.get(active_openvpn_node_id)
+            if active_node:
+                seen_ids.add(active_openvpn_node_id)
+                merged.append(active_node)
+
+        for old in cached:
+            node_id = old["id"]
+            if node_id not in seen_ids:
+                if old.get("config_text"):
+                    seen_ids.add(node_id)
+                    merged.append(old)
+
+        merged = sort_all_nodes(merged)
+        if len(merged) > 1000:
+            merged = merged[:1000]
+        write_json(NODES_FILE, merged)
+
+        available_nodes = [n for n in merged if n.get("active") or n.get("probe_status") == "available"]
+        num_available = len(available_nodes)
+
+    tested = 0
+    failed = 0
+    newly_added = 0
+
+    if num_available < TARGET_VALID_NODES:
+        blacklist = load_blacklist()
+        with lock:
+            merged = read_json(NODES_FILE, [])
+            to_test = [
+                n for n in merged
+                if n.get("probe_status") == "not_checked" and n["id"] not in blacklist and not n.get("active")
+            ]
+            to_test.sort(key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping"))))
+            
+        def test_worker(n_info: dict[str, Any]) -> tuple[str, int, bool, str, dict[str, Any]]:
+            node_id = n_info["id"]
+            config_file = n_info["config_file"]
+            config_text = n_info["config_text"]
+            h = n_info["h"]
+            p = n_info["p"]
+            fallback_ping = n_info["fallback_ping"]
+            
+            temp_path = Path(config_file)
+            try:
+                CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+                temp_path.write_text(config_text, encoding="utf-8")
+            except Exception as e:
+                return node_id, 0, False, f"Failed to write temp config: {e}", {}
+                
+            latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+            ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=15, dev="tun")
+            
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+                
+            temp_node = {
+                "owner": "",
+                "asn": "",
+                "as_name": "",
+                "location": "",
+                "ip_type": "",
+                "quality": "",
+            }
+            if ok:
+                ip_to_enrich = {
+                    "ip": n_info.get("ip"),
+                    "remote_host": h,
+                    "owner": "",
+                    "asn": "",
+                    "as_name": "",
+                    "location": "",
+                    "ip_type": "",
+                    "quality": "",
+                }
+                vpn_utils.enrich_ip_info([ip_to_enrich])
+                temp_node.update(ip_to_enrich)
+            return node_id, latency, ok, message, temp_node
+
+        batch_size = 5
+        for i in range(0, len(to_test), batch_size):
+            with lock:
+                current_nodes = read_json(NODES_FILE, [])
+                num_available = len([n for n in current_nodes if n.get("active") or n.get("probe_status") == "available"])
+            if num_available >= TARGET_VALID_NODES:
+                break
+            
+            batch = to_test[i : i + batch_size]
+            batch_infos = []
+            for n in batch:
+                batch_infos.append({
+                    "id": n["id"],
+                    "config_file": str(n["config_file"]),
+                    "config_text": n.get("config_text") or "",
+                    "h": str(n.get("remote_host") or n.get("ip")),
+                    "p": parse_int(n.get("remote_port")),
+                    "fallback_ping": parse_int(n.get("ping")),
+                    "ip": n.get("ip"),
+                })
+                
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch_infos)) as executor:
+                futures = {executor.submit(test_worker, info): info for info in batch_infos}
+                for future in concurrent.futures.as_completed(futures):
+                    info = futures[future]
+                    try:
+                        node_id, latency, ok, message, temp_node = future.result()
+                    except Exception as exc:
+                        node_id = info["id"]
+                        latency = 0
+                        ok = False
+                        message = f"test error: {exc}"
+                        temp_node = {}
+                    
+                    tested += 1
+                    
+                    with lock:
+                        current_nodes = read_json(NODES_FILE, [])
+                        node_res = next((item for item in current_nodes if item.get("id") == node_id), None)
+                        if node_res:
+                            node_res["latency_ms"] = latency
+                            node_res["probe_status"] = "available" if ok else "unavailable"
+                            node_res["probe_message"] = message
+                            node_res["probed_at"] = time.time()
+                            if ok:
+                                node_res.update(temp_node)
+                                num_available += 1
+                                newly_added += 1
+                            else:
+                                mark_blacklisted(node_res, message)
+                                failed += 1
+                            
+                            sorted_nodes = sort_all_nodes(current_nodes)
+                            write_json(NODES_FILE, sorted_nodes)
+
+    with lock:
+        merged = read_json(NODES_FILE, [])
+        if not active_openvpn_running():
+            available_candidates = [n for n in merged if n.get("probe_status") == "available"]
+            if available_candidates:
+                best_node = available_candidates[0]
+                config_path = Path(best_node["config_file"])
+                try:
+                    CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+                    config_path.write_text(best_node.get("config_text") or "", encoding="utf-8")
+                except Exception as e:
+                    print(f"[auto_connect] Failed to write connection config: {e}", flush=True)
+                else:
+                    ok, message, process = run_openvpn_until_ready(str(best_node["config_file"]), keep_alive=True, route_nopull=True)
+                    if ok and process is not None:
+                        active_openvpn_process = process
+                        active_openvpn_node_id = best_node["id"]
+                        best_node["active"] = True
+                        best_node["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
+                        setup_policy_routing("tun0")
+                    else:
+                        try:
+                            if config_path.exists():
+                                config_path.unlink()
+                        except Exception:
+                            pass
+                        mark_blacklisted(best_node, message)
+                        best_node["probe_status"] = "unavailable"
+                        best_node["probe_message"] = message
+                merged = sort_all_nodes(merged)
+                write_json(NODES_FILE, merged)
+
+        valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+
+    message = (
+        f"Parsed {len(merged)} nodes; baseline {valid_nodes_count}/{TARGET_VALID_NODES} available; "
+        f"tested {tested} in background (new available: {newly_added}, failed: {failed}); "
+        f"active: {active_openvpn_node_id or 'none'}."
+    )
+    set_state(
+        last_check_at=time.time(),
+        last_check_message=message,
+        active_openvpn_node_id=active_openvpn_node_id,
+        valid_nodes=valid_nodes_count,
+        blacklisted_nodes=len(load_blacklist()),
+    )
+    return message
+
+def collector_loop() -> None:
+    while True:
+        try:
+            maintain_valid_nodes(force=False)
+        except Exception as exc:
+            set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AimiliVPN 节点池管理系统</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    
+    :root {
+      --bg-dark: #0b0f19;
+      --bg-surface: rgba(22, 30, 49, 0.6);
+      --bg-surface-hover: rgba(30, 41, 67, 0.85);
+      --border-color: rgba(255, 255, 255, 0.08);
+      --border-color-hover: rgba(99, 102, 241, 0.35);
+      --text-primary: #f3f4f6;
+      --text-secondary: #9ca3af;
+      --primary: #6366f1;
+      --primary-gradient: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+      --primary-hover: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
+      --success: #10b981;
+      --success-gradient: linear-gradient(135deg, #34d399 0%, #059669 100%);
+      --danger: #f43f5e;
+      --danger-gradient: linear-gradient(135deg, #fb7185 0%, #e11d48 100%);
+      --warning: #f59e0b;
+      --warning-gradient: linear-gradient(135deg, #fbbf24 0%, #d97706 100%);
+      --active-row-bg: rgba(99, 102, 241, 0.08);
+      --active-row-border: rgba(99, 102, 241, 0.25);
+    }
+
+    body {
+      margin: 0;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg-dark);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
+        radial-gradient(at 50% 100%, rgba(79, 70, 229, 0.05) 0px, transparent 50%);
+      background-attachment: fixed;
+      color: var(--text-primary);
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    header {
+      padding: 16px 32px;
+      background: rgba(11, 15, 25, 0.7);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .brand {
+      display: flex;
+      flex-direction: column;
+    }
+
+    h1 {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0;
+      background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 10px var(--success);
+      display: inline-block;
+    }
+
+    .btn-group {
+      display: flex;
+      gap: 12px;
+    }
+
+    button {
+      height: 38px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 0 16px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-primary);
+    }
+
+    button:hover {
+      background: rgba(255, 255, 255, 0.08);
+      border-color: rgba(255, 255, 255, 0.15);
+      transform: translateY(-1px);
+    }
+
+    .btn-primary {
+      background: var(--primary-gradient);
+      color: white;
+      border: none;
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+    }
+
+    .btn-primary:hover {
+      background: var(--primary-hover);
+      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
+    }
+
+    .btn-danger {
+      background: var(--danger-gradient);
+      color: white;
+      border: none;
+      box-shadow: 0 4px 12px rgba(244, 63, 94, 0.2);
+    }
+
+    .btn-danger:hover {
+      opacity: 0.95;
+      box-shadow: 0 6px 16px rgba(244, 63, 94, 0.35);
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none !important;
+      box-shadow: none !important;
+    }
+
+    main {
+      padding: 24px 32px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .stat {
+      background: var(--bg-surface);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .stat:hover {
+      background: var(--bg-surface-hover);
+      border-color: var(--border-color-hover);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(99, 102, 241, 0.1);
+    }
+
+    .stat-info {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .stat strong {
+      font-size: 32px;
+      font-weight: 700;
+      display: block;
+      margin-bottom: 4px;
+      background: linear-gradient(135deg, #ffffff 0%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .stat span {
+      font-size: 13px;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .stat-icon-wrapper {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.04);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .stat-icon {
+      width: 22px;
+      height: 22px;
+      color: var(--primary);
+    }
+
+    .stat:nth-child(2) .stat-icon { color: var(--warning); }
+    .stat:nth-child(3) .stat-icon { color: var(--success); }
+    .stat:nth-child(4) .stat-icon { color: var(--danger); }
+
+    .ad-section {
+      background: var(--bg-surface);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    
+    .ad-card {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    
+    .ad-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .ad-badge {
+      background: var(--primary-gradient);
+      color: white;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 700;
+      text-transform: uppercase;
+      box-shadow: 0 2px 6px rgba(99, 102, 241, 0.3);
+    }
+    
+    .ad-links {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    
+    .ad-item {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.04);
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      justify-content: space-between;
+      transition: all 0.2s ease;
+    }
+    
+    .ad-item:hover {
+      background: rgba(255, 255, 255, 0.04);
+      border-color: var(--border-color-hover);
+      transform: translateY(-2px);
+    }
+    
+    .ad-tag {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      width: fit-content;
+    }
+    
+    .tag-normal {
+      background: rgba(99, 102, 241, 0.15);
+      color: #a5b4fc;
+      border: 1px solid rgba(99, 102, 241, 0.2);
+    }
+    
+    .tag-opt {
+      background: rgba(245, 158, 11, 0.15);
+      color: #fde047;
+      border: 1px solid rgba(245, 158, 11, 0.2);
+    }
+    
+    .tag-premium {
+      background: rgba(16, 185, 129, 0.15);
+      color: #6ee7b7;
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+    
+    .ad-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+      flex: 1;
+    }
+    
+    .ad-btn {
+      align-self: flex-start;
+      text-decoration: none;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--text-primary);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 6px;
+      transition: all 0.2s ease;
+      text-align: center;
+    }
+    
+    .ad-item:hover .ad-btn {
+      background: var(--primary-gradient);
+      border-color: transparent;
+      color: white;
+      box-shadow: 0 4px 10px rgba(99, 102, 241, 0.2);
+    }
+    
+    .ad-footer {
+      border-top: 1px dashed rgba(255, 255, 255, 0.08);
+      padding-top: 12px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      text-align: center;
+    }
+    
+    .forum-link {
+      color: #818cf8;
+      font-weight: 700;
+      text-decoration: none;
+      transition: color 0.2s ease;
+    }
+    
+    .forum-link:hover {
+      color: #a5b4fc;
+      text-decoration: underline;
+    }
+
+    .toolbar {
+      background: var(--bg-surface);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar select {
+      width: 180px;
+      height: 42px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 0 12px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 14px;
+      outline: none;
+      transition: all 0.2s ease;
+      cursor: pointer;
+    }
+
+    .toolbar select:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+      background: #0f172a;
+    }
+
+    .toolbar input {
+      flex: 1;
+      min-width: 250px;
+      height: 42px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 0 16px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 14px;
+      transition: all 0.2s ease;
+    }
+
+    .toolbar input:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+      background: rgba(15, 23, 42, 0.8);
+    }
+
+    .table-wrapper {
+      background: var(--bg-surface);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+    }
+
+    .table-container {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      min-width: 1000px;
+    }
+
+    th, td {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border-color);
+      font-size: 14px;
+    }
+
+    th {
+      background: rgba(17, 24, 39, 0.4);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-secondary);
+    }
+
+    tr {
+      transition: background 0.2s ease;
+    }
+
+    tr:hover {
+      background: rgba(255, 255, 255, 0.015);
+    }
+
+    .active-row {
+      background: var(--active-row-bg) !important;
+    }
+
+    .active-row td {
+      border-bottom: 1px solid var(--active-row-border);
+      border-top: 1px solid var(--active-row-border);
+    }
+
+    .badge {
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid transparent;
+    }
+
+    .badge-pulse {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 1.5s infinite;
+      display: inline-block;
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(0.9); opacity: 1; }
+      50% { transform: scale(1.6); opacity: 0.4; }
+      100% { transform: scale(0.9); opacity: 1; }
+    }
+
+    .available {
+      background: rgba(16, 185, 129, 0.1);
+      color: #34d399;
+      border-color: rgba(16, 185, 129, 0.2);
+    }
+
+    .unavailable {
+      background: rgba(244, 63, 94, 0.1);
+      color: #fb7185;
+      border-color: rgba(244, 63, 94, 0.2);
+    }
+
+    .not_checked {
+      background: rgba(245, 158, 11, 0.1);
+      color: #fbbf24;
+      border-color: rgba(245, 158, 11, 0.2);
+    }
+
+    .current-badge {
+      background: rgba(99, 102, 241, 0.15);
+      color: #818cf8;
+      border-color: rgba(99, 102, 241, 0.3);
+    }
+
+    .table-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .connect-btn {
+      background: transparent;
+      color: #818cf8;
+      border: 1px solid rgba(99, 102, 241, 0.4);
+      border-radius: 6px;
+      padding: 0 12px;
+      height: 30px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .connect-btn:hover {
+      background: var(--primary-gradient);
+      color: white;
+      border-color: transparent;
+      box-shadow: 0 4px 10px rgba(99, 102, 241, 0.3);
+    }
+
+    .test-btn {
+      background: transparent;
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      border-radius: 6px;
+      padding: 0 12px;
+      height: 30px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .test-btn:hover {
+      background: var(--success-gradient);
+      color: white;
+      border-color: transparent;
+      box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3);
+    }
+
+    .test-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .mono {
+      font-family: 'JetBrains Mono', Consolas, monospace;
+      font-size: 13px;
+      color: #e2e8f0;
+    }
+
+    .latency-val {
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    .latency-good {
+      background: rgba(16, 185, 129, 0.1);
+      color: #34d399;
+    }
+    
+    .latency-medium {
+      background: rgba(245, 158, 11, 0.1);
+      color: #fbbf24;
+    }
+    
+    .latency-poor {
+      background: rgba(244, 63, 94, 0.1);
+      color: #fb7185;
+    }
+
+    @media (max-width: 768px) {
+      header {
+        flex-direction: column;
+        align-items: flex-start;
+        padding: 16px 20px;
+      }
+      .btn-group {
+        width: 100%;
+        margin-top: 12px;
+      }
+      .btn-group button {
+        flex: 1;
+      }
+      main {
+        padding: 16px 20px;
+      }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+      AimiliVPN 节点管理系统
+    </h1>
+    <div id="status" class="status"><span class="status-dot"></span>服务加载中...</div>
+  </div>
+  <div class="btn-group">
+    <button id="clear_bad" class="btn-danger">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+      清空黑名单
+    </button>
+    <button id="check" class="btn-primary">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
+      立即检测补齐
+    </button>
+  </div>
+</header>
+<main>
+  <section class="ad-section">
+    <div class="ad-card">
+      <div class="ad-title">
+        <span class="ad-badge">推荐</span> <strong>购买高性价比 VPS 搭建节点或用作客户端</strong>
+      </div>
+      <div class="ad-links">
+        <div class="ad-item">
+          <span class="ad-tag tag-normal">普通用户推荐</span>
+          <span class="ad-desc">RackNerd - 超低折扣价格，日常使用实惠方便，海外多机房可选，推荐普通家庭或低频用户。</span>
+          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="ad-btn">点击进入官网</a>
+        </div>
+        <div class="ad-item">
+          <span class="ad-tag tag-opt">网络优化推荐</span>
+          <span class="ad-desc">VMiss - 专线优化网络 (CN2 GIA/9929/CMIN2 等顶级线路)，低延迟不丢包，推荐高网络要求用户。</span>
+          <a href="https://app.vmiss.com/aff.php?aff=4619" target="_blank" class="ad-btn">点击进入官网</a>
+        </div>
+        <div class="ad-item">
+          <span class="ad-tag tag-premium">高端企业推荐</span>
+          <span class="ad-desc">BandwagonHost (搬瓦工) - 直连三网顶级专线，经典高带宽 CN2 GIA 线路，超凡稳定速度。</span>
+          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="ad-btn">点击进入官网</a>
+        </div>
+      </div>
+      <div class="ad-footer">
+        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" class="forum-link">339936.xyz</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="stats">
+    <div class="stat">
+      <div class="stat-info">
+        <strong id="total">0</strong>
+        <span>可用节点池</span>
+      </div>
+      <div class="stat-icon-wrapper">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+      </div>
+    </div>
+    <div class="stat">
+      <div class="stat-info">
+        <strong id="target">3</strong>
+        <span>目标储备数</span>
+      </div>
+      <div class="stat-icon-wrapper">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+      </div>
+    </div>
+    <div class="stat">
+      <div class="stat-info">
+        <strong id="active">0</strong>
+        <span>已激活连接</span>
+      </div>
+      <div class="stat-icon-wrapper">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+      </div>
+    </div>
+    <div class="stat">
+      <div class="stat-info">
+        <strong id="bad">0</strong>
+        <span>黑名单节点</span>
+      </div>
+      <div class="stat-icon-wrapper">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
+      </div>
+    </div>
+  </section>
+  <section class="toolbar">
+    <select id="country_filter">
+      <option value="">所有国家</option>
+    </select>
+    <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
+  </section>
+  <div class="table-wrapper">
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 110px;">连接状态</th>
+            <th style="width: 100px;">Ping 延迟</th>
+            <th style="width: 220px;">IP 地址 : 端口</th>
+            <th>物理位置</th>
+            <th style="width: 100px;">ASN</th>
+            <th>运营主体 / ISP</th>
+            <th style="width: 110px;">网络质量</th>
+            <th style="width: 110px;">IP 类型</th>
+            <th style="width: 160px;">操作</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+let nodes=[], state={}, testingNodeIds = new Set();
+const $=id=>document.getElementById(id);
+const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\\"":"&quot;","'":"&#039;"}[c]));
+const base=p=>(p||"").split(/[\\/]/).pop();
+function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
+function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
+
+const translateQuality = q => {
+  const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
+  return dict[q] || q || "-";
+};
+
+const translateIpType = t => {
+  const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "移动网", "proxy": "代理 IP"};
+  return dict[t] || t || "-";
+};
+
+const translateCountry = c => {
+  const dict = {
+    "Japan": "日本",
+    "Korea Republic of": "韩国",
+    "Korea": "韩国",
+    "Republic of Korea": "韩国",
+    "Thailand": "泰国",
+    "United States": "美国",
+    "United Kingdom": "英国",
+    "Russian Federation": "俄罗斯",
+    "Russian": "俄罗斯",
+    "Viet Nam": "越南",
+    "Vietnam": "越南",
+    "China": "中国",
+    "Taiwan": "台湾",
+    "Taiwan Province of China": "台湾",
+    "Hong Kong": "香港",
+    "Singapore": "新加坡",
+    "Malaysia": "马来西亚",
+    "Indonesia": "印度尼西亚",
+    "India": "印度",
+    "Philippines": "菲律宾",
+    "Australia": "澳大利亚",
+    "New Zealand": "新西兰",
+    "Canada": "加拿大",
+    "Ukraine": "乌克兰",
+    "France": "法国",
+    "Germany": "德国",
+    "Netherlands": "荷兰",
+    "Sweden": "瑞典",
+    "Norway": "挪威",
+    "Spain": "西班牙",
+    "Turkey": "土耳其",
+    "South Africa": "南非",
+    "Brazil": "巴西",
+    "Argentina": "阿根廷",
+    "Chile": "智利",
+    "Mexico": "墨西哥",
+    "Egypt": "埃及",
+    "Romania": "罗马尼亚",
+    "Poland": "波兰",
+    "Kazakhstan": "哈萨克斯坦",
+    "Georgia": "格鲁吉亚",
+    "Mongolia": "蒙古",
+    "Saudi Arabia": "沙特阿拉伯",
+    "Iran": "伊朗",
+    "Iraq": "伊拉克",
+    "Colombia": "哥伦比亚",
+    "Cambodia": "柬埔寨",
+    "Ireland": "爱尔兰",
+    "Italy": "意大利",
+    "Switzerland": "瑞士",
+    "Belgium": "比利时",
+    "Austria": "奥地利",
+    "Denmark": "丹麦",
+    "Finland": "芬兰",
+    "Portugal": "葡萄牙",
+    "Greece": "希腊",
+    "Czech Republic": "捷克",
+    "Hungary": "匈羊利",
+    "Israel": "以色列",
+    "United Arab Emirates": "阿联酋",
+    "UAE": "阿联酋",
+    "Macao": "澳门",
+    "Macau": "澳门",
+    "Iceland": "冰岛",
+    "Luxembourg": "卢森堡"
+  };
+  return dict[c] || c || "-";
+};
+
+const translateStatus = s => {
+  const dict = {"available": "可用", "unavailable": "不可用", "not_checked": "待检测"};
+  return dict[s] || s || "待检测";
+};
+
+function getLatencyClass(ms) {
+  if (!ms) return '';
+  if (ms < 50) return 'latency-good';
+  if (ms < 150) return 'latency-medium';
+  return 'latency-poor';
+}
+
+function updateCountryFilter() {
+  const select = $("country_filter");
+  const selectedValue = select.value;
+  const countries = Array.from(new Set(nodes.map(n => n.country).filter(Boolean))).sort();
+  
+  const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
+  if (JSON.stringify(countries) === JSON.stringify(currentOptions)) {
+    return;
+  }
+  
+  select.innerHTML = '<option value="">所有国家</option>' + 
+    countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  
+  if (countries.includes(selectedValue)) {
+    select.value = selectedValue;
+  } else {
+    select.value = "";
+  }
+}
+
+function render(){
+  const q=$("search").value.toLowerCase();
+  const selectedCountry = $("country_filter").value;
+  
+  const shown=nodes.filter(n=>{
+    if (selectedCountry && n.country !== selectedCountry) {
+      return false;
+    }
+    const searchStr = [
+      n.country,
+      n.country_short,
+      n.ip,
+      n.remote_host,
+      n.proto,
+      translateQuality(n.quality),
+      translateIpType(n.ip_type),
+      n.location,
+      n.owner,
+      n.as_name
+    ].join(" ").toLowerCase();
+    return searchStr.includes(q);
+  });
+  
+  $("total").textContent=nodes.length; 
+  $("target").textContent=state.target_valid_nodes||3;
+  $("active").textContent=state.active_openvpn_node_id?1:0; 
+  $("bad").textContent=state.blacklisted_nodes||0;
+  
+  const statusMessage = state.last_check_message || "";
+  const activeNodeInfo = state.active_openvpn_node_id ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${state.active_openvpn_node_id}</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
+  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  
+  $("rows").innerHTML=shown.map(n=>{
+    const isAct = n.active;
+    const badgeClass = isAct ? 'current-badge' : (n.probe_status || 'not_checked');
+    const badgeText = isAct ? '<span class="badge-pulse"></span>当前连接' : translateStatus(n.probe_status);
+    const latencyClass = getLatencyClass(n.latency_ms);
+    const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
+    const displayLocation = n.location || translateCountry(n.country) || "-";
+    
+    const isTesting = testingNodeIds.has(n.id);
+    const testBtn = `<button class="test-btn" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${isTesting ? '检测中...' : '检测'}</button>`;
+    const connectBtn = `<button class="connect-btn" onclick="connectNode('${esc(n.id)}')">切换</button>`;
+    
+    return `<tr class="${isAct?'active-row':''}">
+      <td><span class="badge ${badgeClass}">${badgeText}</span></td>
+      <td>${latencyText}</td>
+      <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+      <td>${esc(displayLocation)}</td>
+      <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
+      <td>${esc(n.owner||n.as_name||"-")}</td>
+      <td>${esc(translateQuality(n.quality))}</td>
+      <td>${esc(translateIpType(n.ip_type))}</td>
+      <td>
+        <div class="table-actions">
+          ${testBtn}
+          ${connectBtn}
+        </div>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+async function testNode(btn, id, event){
+  if (event) event.stopPropagation();
+  testingNodeIds.add(id);
+  render();
+  try {
+    const response = await fetch("./api/test_node", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id })
+    });
+    const result = await response.json();
+    if (result.ok && result.node) {
+      const idx = nodes.findIndex(n => n.id === id);
+      if (idx !== -1) {
+        nodes[idx] = result.node;
+      }
+    } else {
+      alert("测试失败: " + (result.error || "未知错误"));
+    }
+  } catch (e) {
+    alert("请求失败: " + e.message);
+  } finally {
+    testingNodeIds.delete(id);
+    render();
+  }
+}
+
+async function connectNode(id){
+  const btn = document.querySelector(`button[onclick*="${id}"]`);
+  if(btn) { btn.disabled=true; btn.textContent="连接中..."; }
+  try {
+    await fetch("./api/connect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+  } catch(e) {}
+  await load();
+}
+
+async function load(){
+  const r=await fetch("./api/nodes"); 
+  const d=await r.json(); 
+  nodes=d.nodes||[]; 
+  state=d.state||{}; 
+  updateCountryFilter();
+  render();
+}
+
+$("search").oninput=render;
+$("country_filter").onchange=render;
+$("clear_bad").onclick=async()=>{ 
+  $("clear_bad").disabled=true; 
+  $("clear_bad").textContent="清理中..."; 
+  try{await fetch("./api/clear_blacklist",{method:"POST"}); await load();} 
+  finally{$("clear_bad").disabled=false; $("clear_bad").textContent="清空黑名单";}
+};
+$("check").onclick=async()=>{ 
+  $("check").disabled=true; 
+  $("check").textContent="检测中..."; 
+  try{await fetch("./api/check",{method:"POST"}); await load();} 
+  finally{$("check").disabled=false; $("check").textContent="立即检测补齐";}
+};
+load(); 
+setInterval(load,10000);
+</script>
+</body></html>"""
+
+class Handler(BaseHTTPRequestHandler):
+    def get_secret_path(self) -> str:
+        auth_file = DATA_DIR / "ui_auth.json"
+        if not auth_file.exists():
+            try:
+                DATA_DIR.mkdir(exist_ok=True)
+                auth_file.write_text(json.dumps({"secret_path": "EJsW2EeBo9lY"}), encoding="utf-8")
+            except Exception:
+                pass
+            return "EJsW2EeBo9lY"
+        try:
+            creds = json.loads(auth_file.read_text(encoding="utf-8"))
+            if "secret_path" in creds:
+                return creds["secret_path"]
+            elif "password" in creds:
+                secret_path = creds["password"]
+                try:
+                    auth_file.write_text(json.dumps({"secret_path": secret_path}), encoding="utf-8")
+                except Exception:
+                    pass
+                return secret_path
+            return "EJsW2EeBo9lY"
+        except Exception:
+            return "EJsW2EeBo9lY"
+
+    def validate_path(self) -> str:
+        secret_path = self.get_secret_path()
+        if not secret_path:
+            return self.path
+        if self.path == f"/{secret_path}":
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", f"/{secret_path}/")
+            self.end_headers()
+            return ""
+        prefix = f"/{secret_path}/"
+        if self.path.startswith(prefix):
+            return "/" + self.path[len(prefix):]
+        self.send_response(HTTPStatus.NOT_FOUND)
+        self.end_headers()
+        return ""
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
+
+    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self.send_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
+
+    def do_GET(self) -> None:
+        effective_path = self.validate_path()
+        if effective_path == "": return
+        if effective_path in ("/", "/index.html"):
+            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        elif effective_path == "/api/nodes":
+            nodes = read_json(NODES_FILE, [])
+            stripped_nodes = []
+            for n in nodes:
+                stripped = n.copy()
+                if "config_text" in stripped:
+                    del stripped["config_text"]
+                stripped_nodes.append(stripped)
+            self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path.startswith("/configs/"):
+            filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
+            with lock:
+                nodes = read_json(NODES_FILE, [])
+                node = next((n for n in nodes if Path(n.get("config_file", "")).name == filename), None)
+            if node and node.get("config_text"):
+                self.send_bytes(node["config_text"].encode("utf-8"), "application/x-openvpn-profile")
+            else:
+                self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        else:
+            self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        effective_path = self.validate_path()
+        if effective_path == "": return
+        if effective_path == "/api/check":
+            try:
+                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/clear_blacklist":
+            try:
+                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/connect":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/test_node":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                node_id = str(payload.get("id") or "")
+                updated_node = test_node_by_id(node_id)
+                self.send_json({"ok": True, "node": updated_node})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        else:
+            self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+class Tee:
+    def __init__(self, file_path: str):
+        Path(file_path).parent.mkdir(exist_ok=True, parents=True)
+        self.file = open(file_path, "a", encoding="utf-8")
+        self.stdout = sys.stdout
+
+    def write(self, data: str) -> None:
+        self.stdout.write(data)
+        self.file.write(data)
+        self.file.flush()
+
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+
+def main() -> None:
+    ensure_dirs()
+    
+    log_file = DATA_DIR / "vpngate.log"
+    tee = Tee(str(log_file))
+    sys.stdout = tee
+    sys.stderr = tee
+
+    write_json(
+        STATE_FILE,
+        {
+            "api_url": API_URL,
+            "target_valid_nodes": TARGET_VALID_NODES,
+            "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
+            "check_interval_seconds": CHECK_INTERVAL_SECONDS,
+            "local_proxy": f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
+            "active_openvpn_node_id": "",
+            "last_fetch_status": "starting",
+            "last_check_message": "service starting",
+            "blacklisted_nodes": len(load_blacklist()),
+        },
+    )
+    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+    threading.Thread(target=collector_loop, daemon=True).start()
+    
+    print(f"UI: http://{UI_HOST}:{UI_PORT}/", flush=True)
+    print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
+    ThreadingHTTPServer((UI_HOST, UI_PORT), Handler).serve_forever()
+
+if __name__ == "__main__":
+    main()
