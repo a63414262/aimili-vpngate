@@ -51,6 +51,8 @@ lock = threading.RLock()
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 is_connecting = False
+last_active_ping_time = 0.0
+last_active_latency = 0
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -158,13 +160,15 @@ def set_state(**updates: Any) -> None:
     write_json(STATE_FILE, state)
 
 def get_state() -> dict[str, Any]:
+    global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
+    state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["is_connecting"] = is_connecting
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
     state.setdefault("local_proxy", f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}")
-    state.setdefault("active_openvpn_node_id", active_openvpn_node_id)
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
@@ -494,20 +498,19 @@ def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    active_nodes = [n for n in nodes if n.get("active")]
     available_nodes = sorted(
-        [n for n in nodes if not n.get("active") and n.get("probe_status") == "available"],
+        [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
         key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score")))
     )
     untested_nodes = sorted(
-        [n for n in nodes if not n.get("active") and n.get("probe_status") == "not_checked"],
+        [n for n in nodes if n.get("probe_status") == "not_checked" and not n.get("active")],
         key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping")))
     )
     unavailable_nodes = sorted(
-        [n for n in nodes if not n.get("active") and n.get("probe_status") == "unavailable"],
+        [n for n in nodes if n.get("probe_status") == "unavailable" and not n.get("active")],
         key=lambda n: (-parse_int(n.get("score")), -float(n.get("probed_at", 0)))
     )
-    return active_nodes + available_nodes + untested_nodes + unavailable_nodes
+    return available_nodes + untested_nodes + unavailable_nodes
 
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
@@ -744,6 +747,20 @@ def connect_node(node_id: str) -> str:
         active_openvpn_process = process
         active_openvpn_node_id = node_id
         setup_policy_routing("tun0")
+        
+        global last_active_ping_time, last_active_latency
+        last_active_ping_time = time.time()
+        last_active_latency = 0
+        try:
+            ip = node.get("ip") or node.get("remote_host")
+            port = parse_int(node.get("remote_port"))
+            fallback = parse_int(node.get("ping"))
+            latency = vpn_utils.ping_latency_ms(ip, port, fallback)
+            if latency > 0:
+                last_active_latency = latency
+        except Exception:
+            pass
+            
         for item in nodes:
             item["active"] = item.get("id") == node_id
             if item["active"]:
@@ -1626,6 +1643,10 @@ INDEX_HTML = r"""<!doctype html>
 
     .active-row {
       background: var(--active-row-bg) !important;
+      outline: 2px solid var(--success) !important;
+      outline-offset: -2px;
+      position: relative;
+      z-index: 5;
     }
 
     .active-row td {
@@ -1657,6 +1678,11 @@ INDEX_HTML = r"""<!doctype html>
       0% { transform: scale(0.9); opacity: 1; }
       50% { transform: scale(1.6); opacity: 0.4; }
       100% { transform: scale(0.9); opacity: 1; }
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
 
     .available {
@@ -2087,13 +2113,7 @@ function updateCountryFilter() {
 function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
-  const activeNodeId = state.active_openvpn_node_id;
-  const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
   return nodes.filter(n => {
-    const isCurrentlyActive = activeNode && n.id === activeNode.id;
-    if (isCurrentlyActive) {
-      return true; // Keep active node always visible
-    }
     if (selectedCountry && n.country !== selectedCountry) {
       return false;
     }
@@ -2147,7 +2167,26 @@ function render(){
   
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
-  if (activeNode) {
+  if (state.is_connecting) {
+    activeCardContainer.innerHTML = `
+      <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
+        <div class="active-card-info">
+          <div class="stat-icon-wrapper" style="background: rgba(245, 158, 11, 0.15); border-color: rgba(245, 158, 11, 0.3); width: 48px; height: 48px; border-radius: 12px;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #f59e0b; width: 24px; height: 24px; animation: spin 2s linear infinite;"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18" /></svg>
+          </div>
+          <div class="active-card-details">
+            <div class="active-card-title" style="color: var(--text-primary);">
+              <span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);"><span class="badge-pulse" style="background: #f59e0b;"></span>正在连接</span>
+              <strong>正在加载服务...</strong>
+            </div>
+            <div class="active-card-meta" style="margin-top: 4px;">
+              正在与 VPN 节点建立加密隧道并验证路由规则，请稍候（通常需要 5-15 秒）...
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  } else if (activeNode) {
     const latencyClass = getLatencyClass(activeNode.latency_ms);
     const latencyText = activeNode.latency_ms ? `<span class="latency-val ${latencyClass}">${activeNode.latency_ms} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
@@ -2256,11 +2295,11 @@ function render(){
       const testBtnText = isTesting ? (remainingSeconds !== undefined ? `检测中 (${remainingSeconds}s)` : '同步中...') : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
-      // Connect button is disabled if probe status is "unavailable" and not already active
+      // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${isUnavailable ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+        : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
@@ -2338,19 +2377,56 @@ async function testNode(btn, id, event){
   }
 }
 
+let pollInterval = null;
+
 async function connectNode(id){
-  const btn = document.querySelector(`button[onclick*="${id}"]`);
-  if(btn) { btn.disabled=true; btn.textContent="连接中..."; }
+  state.is_connecting = true;
+  state.active_openvpn_node_id = id;
+  render();
+  
   try {
-    const r = await fetch("./api/connect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+    const r = await fetch("./api/connect",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id})
+    });
     const result = await r.json();
     if (!result.ok) {
       alert("连接失败: " + (result.error || "未知错误"));
+      state.is_connecting = false;
+      render();
+      return;
     }
+    
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(async () => {
+      try {
+        const resp = await fetch("./api/nodes");
+        const data = await resp.json();
+        nodes = data.nodes || [];
+        state = data.state || {};
+        render();
+        
+        if (!state.is_connecting) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          try {
+            await fetch("./api/test_proxy", { method: "POST" });
+          } catch(pe){}
+          location.reload();
+        }
+      } catch(pe) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        location.reload();
+      }
+    }, 1500);
+    
   } catch(e) {
     alert("连接请求错误");
+    state.is_connecting = false;
+    render();
   }
-  await load();
 }
 
 async function disconnectNode(){
@@ -2359,7 +2435,10 @@ async function disconnectNode(){
     const response = await fetch("./api/disconnect", { method: "POST" });
     const result = await response.json();
     if (result.ok) {
-      await load();
+      try {
+        await fetch("./api/test_proxy", { method: "POST" });
+      } catch(pe){}
+      location.reload();
     } else {
       alert("断开连接失败: " + (result.error || "未知错误"));
     }
@@ -2435,15 +2514,9 @@ async function load(){
   nodes=d.nodes||[]; 
   state=d.state||{}; 
   
-  const activeNodeId = state.active_openvpn_node_id;
   nodes.sort((a, b) => {
-    const aActive = a.active || a.id === activeNodeId;
-    const bActive = b.active || b.id === activeNodeId;
-    if (aActive && !bActive) return -1;
-    if (!aActive && bActive) return 1;
-    
-    const aAvail = a.probe_status === "available";
-    const bAvail = b.probe_status === "available";
+    const aAvail = a.probe_status === "available" || a.active;
+    const bAvail = b.probe_status === "available" || b.active;
     if (aAvail && !bAvail) return -1;
     if (!aAvail && bAvail) return 1;
     
@@ -2708,7 +2781,30 @@ class Handler(BaseHTTPRequestHandler):
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
+            global last_active_ping_time, last_active_latency
             nodes = read_json(NODES_FILE, [])
+            active_node = next((n for n in nodes if n.get("active")), None)
+            if active_node:
+                ip = active_node.get("ip") or active_node.get("remote_host")
+                if ip:
+                    now = time.time()
+                    if now - last_active_ping_time > 15.0:
+                        last_active_ping_time = now
+                        def bg_ping(ip_addr: str, port: int, fallback: int) -> None:
+                            global last_active_latency
+                            try:
+                                latency = vpn_utils.ping_latency_ms(ip_addr, port, fallback)
+                                if latency > 0:
+                                    last_active_latency = latency
+                            except Exception:
+                                pass
+                        threading.Thread(
+                            target=bg_ping, 
+                            args=(ip, parse_int(active_node.get("remote_port")), parse_int(active_node.get("ping"))),
+                            daemon=True
+                        ).start()
+                    if last_active_latency > 0:
+                        active_node["latency_ms"] = last_active_latency
             stripped_nodes = []
             for n in nodes:
                 stripped = n.copy()
@@ -2788,6 +2884,9 @@ class Handler(BaseHTTPRequestHandler):
                     for item in nodes:
                         item["active"] = False
                     write_json(NODES_FILE, nodes)
+                global last_active_ping_time, last_active_latency
+                last_active_ping_time = 0.0
+                last_active_latency = 0
                 set_state(active_openvpn_node_id="", last_check_message="手动断开连接")
                 self.send_json({"ok": True})
             except Exception as exc:

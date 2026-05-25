@@ -74,8 +74,6 @@ cat > /lib/systemd/system/aimilivpn.service <<EOF
 Description=AimiliVPN OpenVPN Manager with HTTP/SOCKS5 Proxy
 After=network.target
 
-[Service]
-Type=simple
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=/usr/bin/python3 vpngate_manager.py
 Restart=always
@@ -132,7 +130,7 @@ def save_ui_cfg(cfg):
 def load_state():
     import json
     path = "/opt/aimilivpn/vpngate_data/state.json"
-    state = {"active_openvpn_node_id": "", "last_check_message": ""}
+    state = {"active_openvpn_node_id": "", "last_check_message": "", "is_connecting": False}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -222,6 +220,8 @@ def print_status():
     cfg = load_ui_cfg()
     ui_port = cfg.get("port", 8787)
     secret_path = cfg.get("secret_path", "EJsW2EeBo9lY")
+    state = load_state()
+    is_connecting = state.get("is_connecting", False)
     
     gateway_ok = check_port_listening(7928)
     service_ok = check_service_active("aimilivpn.service")
@@ -239,7 +239,11 @@ def print_status():
     
     gateway_status = f"{green}[已激活]{reset}" if gateway_ok else f"{red}[未启动]{reset}"
     backend_status = f"{green}[已激活] (PID: {pid}){reset}" if (service_ok and pid) else f"{red}[未启动]{reset}"
-    openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
+    
+    if is_connecting:
+        openvpn_status = f"{yellow}[连接中/加载服务...]{reset}"
+    else:
+        openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
     
     print("=======================================================")
     print(f"               {bold}AimiliVPN 管理终端 v2.0{reset}                  ")
@@ -253,11 +257,17 @@ def print_status():
     print(f"  ● 网页登录地址            :  {yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}")
     print()
     print("【活动节点状态】")
-    if active_ip:
+    if is_connecting:
+        print(f"  ● 节点状态                 :  {yellow}正在连接到节点 {state.get('active_openvpn_node_id') or ''} (加载服务中...){reset}")
+    elif active_ip:
         print(f"  ● 节点 IP                 :  {active_ip}")
         print(f"  ● 节点延迟 (直连测试)     :  {latency or '测试中...'}")
     else:
         print("  ● 节点状态                 :  无活动连接")
+    print()
+    print("【使用方法】")
+    print(f"  export http_proxy=socks5://127.0.0.1:7928")
+    print(f"  export https_proxy=socks5://127.0.0.1:7928")
     print("=======================================================")
 
 def start_service():
@@ -347,9 +357,9 @@ def configure_web():
         print(f"  [2] 修改登录后缀 (当前: {cfg.get('secret_path', '')})")
         print("  [3] 返回主菜单")
         print("=======================================================")
-        print("请按数字键 [1-3] 快速执行：")
+        print("请直接输入数字键 [1-3] 快速执行：", end="", flush=True)
         
-        key = get_key()
+        key = getch()
         if key == '1':
             print("\033[H\033[J", end="")
             print("选择网页登录绑定地址：")
@@ -377,7 +387,7 @@ def configure_web():
                 print("输入为空，未作任何修改。")
                 time.sleep(1.5)
             break
-        elif key == '3' or key == 'q' or key == 'ctrl+c':
+        elif key == '3' or key == 'q' or key == '\x03':
             break
 
 def configure_port():
@@ -417,9 +427,9 @@ def configure_password():
         print("  [2] 自定义管理密码")
         print("  [3] 返回主菜单")
         print("=======================================================")
-        print("请按数字键 [1-3] 快速执行：")
+        print("请直接输入数字键 [1-3] 快速执行：", end="", flush=True)
         
-        key = get_key()
+        key = getch()
         if key == '1':
             print("\033[H\033[J", end="")
             import random
@@ -429,8 +439,7 @@ def configure_password():
             print("密码重置成功！")
             print(f"您的全新12位安全密码为: {new_pwd}")
             print("此密码已保存在本地，不需要重启服务，刷新浏览器即可登录。")
-            input("\n按任意键返回主菜单...")
-            break
+            input("\n按任意键返回密码菜单...")
         elif key == '2':
             print("\033[H\033[J", end="")
             new_pwd = input("请输入自定义管理密码 (不可为空): ").strip()
@@ -440,12 +449,11 @@ def configure_password():
                 print("密码更新成功！")
                 print(f"新的管理密码为: {new_pwd}")
                 print("刷新浏览器即可使用新密码登录。")
-                input("\n按任意键返回主菜单...")
+                input("\n按任意键返回密码菜单...")
             else:
                 print("输入为空，未作任何修改。")
                 time.sleep(1.5)
-            break
-        elif key == '3' or key == 'q' or key == 'ctrl+c':
+        elif key == '3' or key == 'q' or key == '\x03':
             break
 
 def getch():
@@ -459,22 +467,6 @@ def getch():
         ch = sys.stdin.read(1)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
-
-def get_key():
-    ch = getch()
-    if ch == '\x1b':
-        ch2 = getch()
-        if ch2 == '[':
-            ch3 = getch()
-            if ch3 == 'A':
-                return 'up'
-            elif ch3 == 'B':
-                return 'down'
-    elif ch == '\r' or ch == '\n':
-        return 'enter'
-    elif ch == '\x03':
-        return 'ctrl+c'
     return ch
 
 def main():
@@ -508,68 +500,57 @@ def main():
             print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password")
         sys.exit(0)
         
-    options = [
-        ("启动服务 (ml start)", start_service),
-        ("停止服务 (ml stop)", stop_service),
-        ("重启服务 (ml restart)", restart_service),
-        ("日志监控 (ml logs)", show_logs),
-        ("网页配置 (ml web)", configure_web),
-        ("端口配置 (ml port)", configure_port),
-        ("密码管理 (ml password)", configure_password),
-        ("一键更新 (ml update)", update_service),
-        ("完全卸载 (ml uninstall)", uninstall_service),
-        ("退出终端 (exit)", None)
-    ]
+    options = {
+        '1': ("启动服务 (ml start)", start_service),
+        '2': ("停止服务 (ml stop)", stop_service),
+        '3': ("重启服务 (ml restart)", restart_service),
+        '4': ("日志监控 (ml logs)", show_logs),
+        '5': ("网页配置 (ml web)", configure_web),
+        '6': ("端口配置 (ml port)", configure_port),
+        '7': ("密码管理 (ml password)", configure_password),
+        '8': ("一键更新 (ml update)", update_service),
+        '9': ("完全卸载 (ml uninstall)", uninstall_service),
+        '0': ("退出终端", None)
+    }
     
-    selected_idx = 0
     while True:
         print("\033[H\033[J", end="")
         print_status()
         
-        print("请使用 [↑/↓] 键选择并按回车确认，或直接输入数字键 [0-9] 快速执行：")
-        print()
-        for i, (name, _) in enumerate(options):
-            num_char = str((i + 1) % 10)
-            if i == selected_idx:
-                print(f" \033[1;32m> [{num_char}] {name}\033[0m")
-            else:
-                print(f"   [{num_char}] {name}")
-        print()
+        bold = "\033[1m"
+        reset = "\033[0m"
+        green = "\033[1;32m"
+        
+        print(f"【{bold}终端指令菜单栏{reset}】")
+        for key in sorted(options.keys()):
+            if key == '0':
+                continue
+            name, _ = options[key]
+            print(f"  {green}[{key}]{reset} {name}")
+        print(f"  {green}[0]{reset} {options['0'][0]}")
+        print("=======================================================")
+        print("请直接输入数字键 [0-9] 快速选择执行：", end="", flush=True)
         
         try:
-            key = get_key()
+            key = getch()
         except KeyboardInterrupt:
             break
             
-        if key == 'up':
-            selected_idx = (selected_idx - 1) % len(options)
-        elif key == 'down':
-            selected_idx = (selected_idx + 1) % len(options)
-        elif key == 'enter':
-            _, func = options[selected_idx]
+        if key == '\x03':
+            break
+            
+        if key in options:
+            name, func = options[key]
             if func is None:
                 break
             print("\033[H\033[J", end="")
+            print(f"正在执行: {name}...\n")
             func()
             if func in (start_service, stop_service, restart_service):
                 continue
-            break
-        elif key in ('1', '2', '3', '4', '5', '6', '7', '8', '9', '0'):
-            mapping = {
-                '1': 0, '2': 1, '3': 2, '4': 3, '5': 4,
-                '6': 5, '7': 6, '8': 7, '9': 8, '0': 9
-            }
-            selected_idx = mapping[key]
-            _, func = options[selected_idx]
-            if func is None:
-                break
-            print("\033[H\033[J", end="")
-            func()
-            if func in (start_service, stop_service, restart_service):
+            if func in (configure_web, configure_port, configure_password, show_logs, update_service):
                 continue
-            break
-        elif key == 'ctrl+c' or key == 'q':
-            break
+            input("\n操作已完成，按回车键返回主菜单...")
 
 if __name__ == "__main__":
     main()
@@ -577,16 +558,33 @@ EOF
 chmod +x /usr/bin/ml
 
 # 7. Start service
-echo -e "\n正在启动 AimiliVPN 服务并检测网络..."
+echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
 systemctl restart aimilivpn.service || true
 
-# Wait for database/auth files generation
-sleep 2
+# Wait and poll for node loading and active connection
+echo -ne "正在加载服务"
+ACTIVE_ID=""
+for i in {1..30}; do
+    if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then
+        ACTIVE_ID=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")
+        if [ -n "$ACTIVE_ID" ]; then
+            echo -e " [${GREEN}已就绪${PLAIN}]"
+            break
+        fi
+    fi
+    echo -n "."
+    sleep 1
+done
+if [ -z "$ACTIVE_ID" ]; then
+    echo -e " [${YELLOW}加载超时，将在后台继续连接${PLAIN}]"
+fi
 
 SECRET_PATH="EJsW2EeBo9lY"
+PASSWORD="未配置"
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 if [ -f "$AUTH_FILE" ]; then
     SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE'))['secret_path'])" 2>/dev/null || echo "EJsW2EeBo9lY")
+    PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE'))['password'])" 2>/dev/null || echo "未配置")
 fi
 
 # Get VPS public IP
@@ -596,7 +594,8 @@ PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 h
 echo -e "\n${GREEN}==========================================================${PLAIN}"
 echo -e "${GREEN}             AimiliVPN 源码一键部署已完成！${PLAIN}"
 echo -e "${GREEN}==========================================================${PLAIN}"
-echo -e "  * 网页控制面板 (Web UI): ${BLUE}http://${PUBLIC_IP}:8787/${SECRET_PATH}/${PLAIN}"
+echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:8787/${SECRET_PATH}/${PLAIN}"
+echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"

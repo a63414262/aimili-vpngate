@@ -7,7 +7,7 @@ def deploy(host, port, username, password, files_to_upload):
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         print(f"Connecting to {host}:{port}...")
-        ssh.connect(host, port=port, username=username, password=password, timeout=10)
+        ssh.connect(host, port=port, username=username, password=password, timeout=10, look_for_keys=False, allow_agent=False)
         print("Connected successfully!")
 
         # SFTP transfer
