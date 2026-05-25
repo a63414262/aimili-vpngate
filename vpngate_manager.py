@@ -1496,6 +1496,38 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </section>
+
+  <section class="proxy-test-section" style="margin-bottom: 24px;">
+    <div class="stat" style="display: flex; flex-direction: row; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; flex-wrap: wrap; gap: 16px;">
+      <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+        <div class="stat-icon-wrapper" style="background: rgba(99, 102, 241, 0.1); border-color: rgba(99, 102, 241, 0.2);">
+          <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color: var(--primary);"><path stroke-linecap="round" stroke-linejoin="round" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071a10.5 10.5 0 0114.14 0M1.414 8.05a16 16 0 0121.172 0" /></svg>
+        </div>
+        <div>
+          <h3 style="margin: 0 0 4px 0; font-size: 16px; font-weight: 600; color: var(--text-primary);">本地代理出口检测 (Port 7928)</h3>
+          <p style="margin: 0; font-size: 13px; color: var(--text-secondary);">
+            测试本地 HTTP/SOCKS5 代理是否成功通过当前 VPN 节点出站，并获取代理的实际出口公网 IP 和延迟。
+          </p>
+        </div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-left: auto;">
+        <div id="proxy_test_result" style="text-align: right;">
+          <div style="font-size: 14px; font-weight: 500; color: var(--text-secondary);">
+            测试状态: <span id="proxy_status_badge" class="badge not_checked" style="margin-left: 4px;">未检测</span>
+          </div>
+          <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
+            出口 IP: <span id="proxy_ip_val" class="mono" style="font-weight: 600; color: var(--text-primary);">-</span> 
+            <span id="proxy_latency_val" style="margin-left: 8px;"></span>
+          </div>
+        </div>
+        <button id="btn_test_proxy" class="btn-primary" style="height: 40px; padding: 0 16px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+          测试代理
+        </button>
+      </div>
+    </div>
+  </section>
+
   <section class="toolbar">
     <select id="country_filter">
       <option value="">所有国家</option>
@@ -1766,10 +1798,76 @@ $("check").onclick=async()=>{
   try{await fetch("./api/check",{method:"POST"}); await load();} 
   finally{$("check").disabled=false; $("check").textContent="立即检测补齐";}
 };
+$("btn_test_proxy").onclick = async () => {
+  const btn = $("btn_test_proxy");
+  const badge = $("proxy_status_badge");
+  const ipVal = $("proxy_ip_val");
+  const latVal = $("proxy_latency_val");
+  
+  btn.disabled = true;
+  btn.innerHTML = `<span class="badge-pulse"></span>测试中...`;
+  badge.className = "badge not_checked";
+  badge.textContent = "检测中...";
+  ipVal.textContent = "-";
+  latVal.textContent = "";
+  
+  try {
+    const response = await fetch("./api/test_proxy", { method: "POST" });
+    const result = await response.json();
+    if (result.ok) {
+      badge.className = "badge available";
+      badge.textContent = "可用";
+      ipVal.textContent = result.ip || "-";
+      
+      const latencyClass = getLatencyClass(result.latency_ms);
+      latVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${result.latency_ms} ms</span>`;
+    } else {
+      badge.className = "badge unavailable";
+      badge.textContent = "不可用";
+      ipVal.textContent = "-";
+      latVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;" title="${esc(result.error)}">连接失败</span>`;
+    }
+  } catch (e) {
+    badge.className = "badge unavailable";
+    badge.textContent = "网络错误";
+    ipVal.textContent = "-";
+    latVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;">请求出错</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 测试代理`;
+  }
+};
 load(); 
 setInterval(load,10000);
 </script>
 </body></html>"""
+
+def test_local_proxy() -> dict[str, Any]:
+    proxy_url = f"http://127.0.0.1:{LOCAL_PROXY_PORT}"
+    proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
+    opener = urllib.request.build_opener(proxy_handler)
+    try:
+        t0 = time.perf_counter()
+        req = urllib.request.Request("https://api.ipify.org?format=json", headers={"User-Agent": "curl/7.68.0"})
+        with opener.open(req, timeout=5) as response:
+            res_data = response.read().decode('utf-8')
+            latency = int((time.perf_counter() - t0) * 1000)
+            try:
+                ip_obj = json.loads(res_data)
+                ip = ip_obj.get("ip") or res_data.strip()
+            except Exception:
+                ip = res_data.strip()
+            return {"ok": True, "ip": ip, "latency_ms": latency}
+    except Exception as e:
+        try:
+            t0 = time.perf_counter()
+            req = urllib.request.Request("https://ifconfig.me/ip", headers={"User-Agent": "curl/7.68.0"})
+            with opener.open(req, timeout=5) as response:
+                ip = response.read().decode('utf-8').strip()
+                latency = int((time.perf_counter() - t0) * 1000)
+                return {"ok": True, "ip": ip, "latency_ms": latency}
+        except Exception as e2:
+            return {"ok": False, "error": f"{e} / {e2}"}
 
 class Handler(BaseHTTPRequestHandler):
     def get_secret_path(self) -> str:
@@ -1879,6 +1977,15 @@ class Handler(BaseHTTPRequestHandler):
                 node_id = str(payload.get("id") or "")
                 updated_node = test_node_by_id(node_id)
                 self.send_json({"ok": True, "node": updated_node})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/test_proxy":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                if length > 0:
+                    self.rfile.read(length)
+                result = test_local_proxy()
+                self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         else:
