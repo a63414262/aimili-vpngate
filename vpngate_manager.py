@@ -851,6 +851,256 @@ def collector_loop() -> None:
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AimiliVPN - 安全登录</title>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #090d16;
+      --bg-surface: rgba(15, 23, 42, 0.45);
+      --border-color: rgba(255, 255, 255, 0.08);
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --primary: #6366f1;
+      --primary-gradient: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+      --primary-hover: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
+      --success: #10b981;
+      --danger: #f43f5e;
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg-dark);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%);
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .login-container {
+      width: 100%;
+      max-width: 400px;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+
+    .login-card {
+      background: var(--bg-surface);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border-color);
+      border-radius: 20px;
+      padding: 40px 32px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+      text-align: center;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .brand-logo {
+      width: 64px;
+      height: 64px;
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 24px auto;
+      color: var(--primary);
+      position: relative;
+    }
+
+    .brand-logo::after {
+      content: '';
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      border-radius: 16px;
+      border: 1px solid var(--success);
+      opacity: 0.5;
+      animation: ripple 2s infinite ease-out;
+    }
+
+    @keyframes ripple {
+      0% { transform: scale(1); opacity: 0.5; }
+      100% { transform: scale(1.3); opacity: 0; }
+    }
+
+    .login-title {
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin: 0 0 8px 0;
+      letter-spacing: 0.5px;
+    }
+
+    .login-subtitle {
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin: 0 0 32px 0;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+      text-align: left;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+      margin-left: 4px;
+    }
+
+    .input-wrapper {
+      position: relative;
+    }
+
+    .input-field {
+      width: 100%;
+      height: 48px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 0 16px;
+      box-sizing: border-box;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 15px;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+
+    .input-field:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+      background: rgba(15, 23, 42, 0.6);
+    }
+
+    .error-message {
+      color: var(--danger);
+      font-size: 13px;
+      margin-top: 8px;
+      min-height: 18px;
+      text-align: left;
+      margin-left: 4px;
+      display: none;
+    }
+
+    .login-btn {
+      width: 100%;
+      height: 48px;
+      background: var(--primary-gradient);
+      border: none;
+      border-radius: 10px;
+      color: white;
+      font-family: inherit;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
+    }
+
+    .login-btn:hover {
+      background: var(--primary-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
+    }
+
+    .login-btn:active {
+      transform: translateY(1px);
+    }
+
+    .login-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="login-card">
+      <div class="brand-logo">
+        <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+      </div>
+      <h2 class="login-title">AimiliVPN</h2>
+      <p class="login-subtitle">请配置或输入您的管理密码以继续</p>
+      
+      <form id="login_form" onsubmit="handleLogin(event)">
+        <div class="form-group">
+          <label class="form-label" for="password">安全密码</label>
+          <div class="input-wrapper">
+            <input type="password" id="password" class="input-field" placeholder="请输入12位安全密码" required autocomplete="current-password">
+          </div>
+          <div id="error_text" class="error-message"></div>
+        </div>
+        
+        <button type="submit" id="submit_btn" class="login-btn">
+          <span>登录</span>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    async function handleLogin(e) {
+      e.preventDefault();
+      const pwd = document.getElementById("password").value;
+      const errorText = document.getElementById("error_text");
+      const submitBtn = document.getElementById("submit_btn");
+      
+      errorText.style.display = "none";
+      submitBtn.disabled = true;
+      submitBtn.querySelector("span").textContent = "正在验证...";
+      
+      try {
+        const response = await fetch("./api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pwd })
+        });
+        
+        const data = await response.json();
+        if (response.ok && data.ok) {
+          window.location.reload();
+        } else {
+          errorText.textContent = data.error || "密码不正确，请重新输入";
+          errorText.style.display = "block";
+          submitBtn.disabled = false;
+          submitBtn.querySelector("span").textContent = "登录";
+        }
+      } catch (err) {
+        errorText.textContent = "连接服务器失败，请稍后重试";
+        errorText.style.display = "block";
+        submitBtn.disabled = false;
+        submitBtn.querySelector("span").textContent = "登录";
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -877,8 +1127,8 @@ INDEX_HTML = r"""<!doctype html>
       --danger-gradient: linear-gradient(135deg, #fb7185 0%, #e11d48 100%);
       --warning: #f59e0b;
       --warning-gradient: linear-gradient(135deg, #fbbf24 0%, #d97706 100%);
-      --active-row-bg: rgba(99, 102, 241, 0.08);
-      --active-row-border: rgba(99, 102, 241, 0.25);
+      --active-row-bg: rgba(16, 185, 129, 0.06);
+      --active-row-border: rgba(16, 185, 129, 0.25);
     }
 
     body {
@@ -1708,9 +1958,12 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
-const pageSize = 10;
+const pageSize = 11;
 let batchCountdown = 0;
 let batchInterval = null;
+let currentPageNodes = [];
+let testingNodesTimeouts = {};
+let testingTimer = null;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -1831,11 +2084,64 @@ function updateCountryFilter() {
   }
 }
 
-function render(){
-  const q=$("search").value.toLowerCase();
+function getFilteredNodes() {
+  const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
-  
-  // Find the active node
+  const activeNodeId = state.active_openvpn_node_id;
+  const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
+  return nodes.filter(n => {
+    const isCurrentlyActive = activeNode && n.id === activeNode.id;
+    if (isCurrentlyActive) {
+      return true; // Keep active node always visible
+    }
+    if (selectedCountry && n.country !== selectedCountry) {
+      return false;
+    }
+    const searchStr = [
+      n.country, n.country_short, n.ip, n.remote_host, n.proto,
+      translateQuality(n.quality), translateIpType(n.ip_type), n.location, n.owner, n.as_name
+    ].join(" ").toLowerCase();
+    return searchStr.includes(q);
+  });
+}
+
+function startTestingTimer() {
+  if (testingTimer) return;
+  testingTimer = setInterval(() => {
+    let active = false;
+    for (const id in testingNodesTimeouts) {
+      if (testingNodesTimeouts[id] > 0) {
+        testingNodesTimeouts[id]--;
+        active = true;
+      } else {
+        delete testingNodesTimeouts[id];
+      }
+    }
+    if (!active) {
+      clearInterval(testingTimer);
+      testingTimer = null;
+    }
+    renderTestingStates();
+  }, 1000);
+}
+
+function renderTestingStates() {
+  document.querySelectorAll(".test-btn[data-node-id]").forEach(btn => {
+    const id = btn.getAttribute("data-node-id");
+    if (testingNodesTimeouts[id] !== undefined) {
+      btn.disabled = true;
+      btn.textContent = `检测中 (${testingNodesTimeouts[id]}s)`;
+    } else if (testingNodeIds.has(id)) {
+      btn.disabled = true;
+      btn.textContent = `同步中...`;
+    } else {
+      btn.disabled = false;
+      btn.textContent = `检测`;
+    }
+  });
+}
+
+function render(){
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
   
@@ -1848,8 +2154,8 @@ function render(){
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(99, 102, 241, 0.15); border-color: rgba(99, 102, 241, 0.3); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #818cf8; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+          <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.3); width: 48px; height: 48px; border-radius: 12px;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
           </div>
           <div class="active-card-details">
             <div class="active-card-title">
@@ -1893,28 +2199,7 @@ function render(){
     `;
   }
 
-  // Filter out the active node from the backups table list, apply filter search
-  const shown=nodes.filter(n=>{
-    if (activeNode && n.id === activeNode.id) {
-      return false;
-    }
-    if (selectedCountry && n.country !== selectedCountry) {
-      return false;
-    }
-    const searchStr = [
-      n.country,
-      n.country_short,
-      n.ip,
-      n.remote_host,
-      n.proto,
-      translateQuality(n.quality),
-      translateIpType(n.ip_type),
-      n.location,
-      n.owner,
-      n.as_name
-    ].join(" ").toLowerCase();
-    return searchStr.includes(q);
-  });
+  const shown = getFilteredNodes();
   
   $("total").textContent=nodes.length; 
   $("target").textContent=state.target_valid_nodes||3;
@@ -1950,27 +2235,34 @@ function render(){
   
   const startIndex = (currentPage - 1) * pageSize;
   const endIndex = Math.min(startIndex + pageSize, shown.length);
-  const pageNodes = shown.slice(startIndex, endIndex);
+  currentPageNodes = shown.slice(startIndex, endIndex);
 
   // Render table rows
-  if (pageNodes.length === 0) {
+  if (currentPageNodes.length === 0) {
     $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
-    $("rows").innerHTML=pageNodes.map(n=>{
-      const badgeClass = n.probe_status || 'not_checked';
-      const badgeText = translateStatus(n.probe_status);
+    $("rows").innerHTML=currentPageNodes.map(n=>{
+      const isCurrentlyActive = activeNode && n.id === activeNode.id;
+      const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
+      
+      const badgeClass = isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked');
+      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(n.probe_status);
       const latencyClass = getLatencyClass(n.latency_ms);
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
       
       const isTesting = testingNodeIds.has(n.id);
-      const testBtn = `<button class="test-btn" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${isTesting ? '检测中...' : '检测'}</button>`;
+      const remainingSeconds = testingNodesTimeouts[n.id];
+      const testBtnText = isTesting ? (remainingSeconds !== undefined ? `检测中 (${remainingSeconds}s)` : '同步中...') : '检测';
+      const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
-      // Connect button is disabled if probe status is "unavailable"
+      // Connect button is disabled if probe status is "unavailable" and not already active
       const isUnavailable = n.probe_status === "unavailable";
-      const connectBtn = `<button class="connect-btn" ${isUnavailable ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+      const connectBtn = isCurrentlyActive 
+        ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
+        : `<button class="connect-btn" ${isUnavailable ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
-      return `<tr>
+      return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td>${latencyText}</td>
         <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
@@ -2006,37 +2298,13 @@ function render(){
 $("btn_first_page").onclick = () => { currentPage = 1; render(); };
 $("btn_prev_page").onclick = () => { if (currentPage > 1) { currentPage--; render(); } };
 $("btn_next_page").onclick = () => {
-  const q=$("search").value.toLowerCase();
-  const selectedCountry = $("country_filter").value;
-  const activeNodeId = state.active_openvpn_node_id;
-  const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
-  const filtered = nodes.filter(n => {
-    if (activeNode && n.id === activeNode.id) return false;
-    if (selectedCountry && n.country !== selectedCountry) return false;
-    const searchStr = [
-      n.country, n.country_short, n.ip, n.remote_host, n.proto,
-      translateQuality(n.quality), translateIpType(n.ip_type), n.location, n.owner, n.as_name
-    ].join(" ").toLowerCase();
-    return searchStr.includes(q);
-  });
-  const totalPages = Math.ceil(filtered.length / pageSize) || 1;
+  const shown = getFilteredNodes();
+  const totalPages = Math.ceil(shown.length / pageSize) || 1;
   if (currentPage < totalPages) { currentPage++; render(); }
 };
 $("btn_last_page").onclick = () => {
-  const q=$("search").value.toLowerCase();
-  const selectedCountry = $("country_filter").value;
-  const activeNodeId = state.active_openvpn_node_id;
-  const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
-  const filtered = nodes.filter(n => {
-    if (activeNode && n.id === activeNode.id) return false;
-    if (selectedCountry && n.country !== selectedCountry) return false;
-    const searchStr = [
-      n.country, n.country_short, n.ip, n.remote_host, n.proto,
-      translateQuality(n.quality), translateIpType(n.ip_type), n.location, n.owner, n.as_name
-    ].join(" ").toLowerCase();
-    return searchStr.includes(q);
-  });
-  const totalPages = Math.ceil(filtered.length / pageSize) || 1;
+  const shown = getFilteredNodes();
+  const totalPages = Math.ceil(shown.length / pageSize) || 1;
   currentPage = totalPages;
   render();
 };
@@ -2044,7 +2312,10 @@ $("btn_last_page").onclick = () => {
 async function testNode(btn, id, event){
   if (event) event.stopPropagation();
   testingNodeIds.add(id);
-  render();
+  testingNodesTimeouts[id] = 35; // 35s default timeout
+  startTestingTimer();
+  renderTestingStates();
+  
   try {
     const response = await fetch("./api/test_node", {
       method: "POST",
@@ -2057,13 +2328,12 @@ async function testNode(btn, id, event){
       if (idx !== -1) {
         nodes[idx] = result.node;
       }
-    } else {
-      alert("测试失败: " + (result.error || "未知错误"));
     }
   } catch (e) {
-    alert("请求失败: " + e.message);
   } finally {
     testingNodeIds.delete(id);
+    delete testingNodesTimeouts[id];
+    renderTestingStates();
     render();
   }
 }
@@ -2100,26 +2370,7 @@ async function disconnectNode(){
 
 // Batch test button implementation
 $("btn_batch_test").onclick = async () => {
-  const q = $("search").value.toLowerCase();
-  const selectedCountry = $("country_filter").value;
-  const activeNodeId = state.active_openvpn_node_id;
-  const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
-  
-  const filtered = nodes.filter(n => {
-    if (activeNode && n.id === activeNode.id) return false;
-    if (selectedCountry && n.country !== selectedCountry) return false;
-    const searchStr = [
-      n.country, n.country_short, n.ip, n.remote_host, n.proto,
-      translateQuality(n.quality), translateIpType(n.ip_type), n.location, n.owner, n.as_name
-    ].join(" ").toLowerCase();
-    return searchStr.includes(q);
-  });
-  
-  const totalPages = Math.ceil(filtered.length / pageSize) || 1;
-  if (currentPage > totalPages) currentPage = totalPages;
-  const startIndex = (currentPage - 1) * pageSize;
-  const pageNodes = filtered.slice(startIndex, startIndex + pageSize);
-  
+  const pageNodes = currentPageNodes || [];
   if (pageNodes.length === 0) {
     alert("当前页面没有可供测试的备选节点");
     return;
@@ -2128,14 +2379,21 @@ $("btn_batch_test").onclick = async () => {
   const nodeIds = pageNodes.map(n => n.id);
   const btn = $("btn_batch_test");
   btn.disabled = true;
-  batchCountdown = 15;
-  btn.innerHTML = `<span class="badge-pulse"></span>测试中... (${batchCountdown}秒)`;
   
-  clearInterval(batchInterval);
-  batchInterval = setInterval(() => {
-    batchCountdown--;
-    if (batchCountdown > 0) {
-      btn.innerHTML = `<span class="badge-pulse"></span>测试中... (${batchCountdown}秒)`;
+  nodeIds.forEach(id => {
+    testingNodeIds.add(id);
+    testingNodesTimeouts[id] = 35;
+  });
+  startTestingTimer();
+  renderTestingStates();
+  
+  let countdown = 35;
+  btn.innerHTML = `<span class="badge-pulse"></span>测试中... (${countdown}秒)`;
+  
+  const batchInterval = setInterval(() => {
+    countdown--;
+    if (countdown > 0) {
+      btn.innerHTML = `<span class="badge-pulse"></span>测试中... (${countdown}秒)`;
     } else {
       btn.innerHTML = `正在同步结果...`;
       clearInterval(batchInterval);
@@ -2156,27 +2414,18 @@ $("btn_batch_test").onclick = async () => {
           nodes[idx] = { ...nodes[idx], ...updatedNode };
         }
       });
-      // Sort nodes locally for immediate visual update
-      nodes.sort((a, b) => {
-        if (a.active) return -1;
-        if (b.active) return 1;
-        if (a.probe_status === "available" && b.probe_status !== "available") return -1;
-        if (a.probe_status !== "available" && b.probe_status === "available") return 1;
-        if (a.probe_status === "available" && b.probe_status === "available") {
-          return (a.latency_ms || 999999) - (b.latency_ms || 999999);
-        }
-        return b.score - a.score;
-      });
-    } else {
-      alert("批量测试失败: " + (result.error || "未知错误"));
     }
   } catch (e) {
-    alert("批量测试请求失败: " + e.message);
   } finally {
     clearInterval(batchInterval);
+    nodeIds.forEach(id => {
+      testingNodeIds.delete(id);
+      delete testingNodesTimeouts[id];
+    });
     btn.disabled = false;
     btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 批量测试本页`;
-    await load();
+    renderTestingStates();
+    render();
   }
 };
 
@@ -2185,6 +2434,25 @@ async function load(){
   const d=await r.json(); 
   nodes=d.nodes||[]; 
   state=d.state||{}; 
+  
+  const activeNodeId = state.active_openvpn_node_id;
+  nodes.sort((a, b) => {
+    const aActive = a.active || a.id === activeNodeId;
+    const bActive = b.active || b.id === activeNodeId;
+    if (aActive && !bActive) return -1;
+    if (!aActive && bActive) return 1;
+    
+    const aAvail = a.probe_status === "available";
+    const bAvail = b.probe_status === "available";
+    if (aAvail && !bAvail) return -1;
+    if (!aAvail && bAvail) return 1;
+    
+    if (aAvail && bAvail) {
+      return (a.latency_ms || 999999) - (b.latency_ms || 999999);
+    }
+    return (b.score || 0) - (a.score || 0);
+  });
+  
   updateCountryFilter();
   render();
 }
@@ -2377,6 +2645,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return "EJsW2EeBo9lY"
 
+    def is_authorized(self) -> bool:
+        ui_cfg = load_ui_config()
+        pwd = ui_cfg.get("password")
+        if not pwd:
+            return True
+        
+        cookie_header = self.headers.get("Cookie", "")
+        cookies = {}
+        if cookie_header:
+            for item in cookie_header.split(";"):
+                item = item.strip()
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    cookies[k.strip()] = v.strip()
+        
+        expected_token = get_session_token(pwd)
+        return cookies.get("session") == expected_token
+
     def validate_path(self) -> str:
         secret_path = self.get_secret_path()
         if not secret_path:
@@ -2410,6 +2696,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
+        
+        if not self.is_authorized():
+            if effective_path in ("/", "/index.html"):
+                self.send_bytes(LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            else:
+                self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                return
+                
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
@@ -2436,6 +2731,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
+        
+        if effective_path == "/api/login":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                input_pwd = str(payload.get("password") or "")
+                
+                ui_cfg = load_ui_config()
+                expected_pwd = ui_cfg.get("password", "")
+                
+                if expected_pwd and input_pwd == expected_pwd:
+                    token = get_session_token(expected_pwd)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    secret_path = self.get_secret_path()
+                    cookie_path = f"/{secret_path}/" if secret_path else "/"
+                    self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+                else:
+                    self.send_json({"ok": False, "error": "密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if not self.is_authorized():
+            self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
         if effective_path == "/api/check":
             try:
                 self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
@@ -2571,9 +2895,13 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     
-    print(f"UI: http://{UI_HOST}:{UI_PORT}/", flush=True)
+    ui_cfg = load_ui_config()
+    ui_host = ui_cfg.get("host", UI_HOST)
+    ui_port = int(ui_cfg.get("port", UI_PORT))
+    
+    print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
-    ThreadingHTTPServer((UI_HOST, UI_PORT), Handler).serve_forever()
+    ThreadingHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":
     main()

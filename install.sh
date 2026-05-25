@@ -104,7 +104,85 @@ import termios
 INSTALL_DIR = "/opt/aimilivpn"
 LOG_FILE = "/opt/aimilivpn/vpngate_data/vpngate.log"
 
-def check_port_listening(port=7928):
+def load_ui_cfg():
+    import json
+    path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
+    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": ""}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    cfg[k] = v
+        except Exception:
+            pass
+    return cfg
+
+def save_ui_cfg(cfg):
+    import json
+    path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def load_state():
+    import json
+    path = "/opt/aimilivpn/vpngate_data/state.json"
+    state = {"active_openvpn_node_id": "", "last_check_message": ""}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    state[k] = v
+        except Exception:
+            pass
+    return state
+
+def get_active_node_ip():
+    import json
+    path = "/opt/aimilivpn/vpngate_data/nodes.json"
+    state = load_state()
+    active_id = state.get("active_openvpn_node_id")
+    if not active_id:
+        return None
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                nodes = json.load(f)
+                for n in nodes:
+                    if n.get("active") or n.get("id") == active_id:
+                        return n.get("ip") or n.get("remote_host")
+        except Exception:
+            pass
+    return None
+
+def ping_ip(ip):
+    if not ip:
+        return None
+    try:
+        # Run standard linux ping command with 1 packet and 2 seconds timeout
+        res = subprocess.run(["ping", "-c", "1", "-W", "2", ip], capture_output=True, text=True, timeout=3)
+        if res.returncode == 0:
+            out = res.stdout
+            lines = out.splitlines()
+            for line in lines:
+                if "rtt" in line or "min/avg" in line:
+                    parts = line.split("=")[1].strip().split("/")
+                    if len(parts) >= 2:
+                        avg_rtt = float(parts[1])
+                        return f"{int(avg_rtt)} ms"
+            return "已响应"
+        else:
+            return "检测超时"
+    except Exception:
+        return "无法连接"
+
+def check_port_listening(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(0.2)
     try:
@@ -121,6 +199,13 @@ def check_service_active(service_name="aimilivpn.service"):
     except Exception:
         return False
 
+def check_openvpn_process():
+    try:
+        res = subprocess.run(["pgrep", "openvpn"], capture_output=True, text=True, timeout=2)
+        return bool(res.stdout.strip())
+    except Exception:
+        return False
+
 def get_service_pid(service_name="aimilivpn.service"):
     try:
         res = subprocess.run(["systemctl", "show", service_name, "--property=MainPID"], capture_output=True, text=True, timeout=2)
@@ -134,26 +219,46 @@ def get_service_pid(service_name="aimilivpn.service"):
     return None
 
 def print_status():
+    cfg = load_ui_cfg()
+    ui_port = cfg.get("port", 8787)
+    secret_path = cfg.get("secret_path", "EJsW2EeBo9lY")
+    
     gateway_ok = check_port_listening(7928)
     service_ok = check_service_active("aimilivpn.service")
+    openvpn_ok = check_openvpn_process()
     pid = get_service_pid("aimilivpn.service")
+    
+    active_ip = get_active_node_ip()
+    latency = ping_ip(active_ip) if active_ip else None
     
     green = "\033[1;32m"
     red = "\033[1;31m"
     reset = "\033[0m"
     bold = "\033[1m"
+    yellow = "\033[1;33m"
     
-    gateway_status = f"{green}运行中{reset}" if gateway_ok else f"{red}未运行{reset}"
-    if service_ok:
-        pid_info = f" (PID: {pid})" if pid else ""
-        service_status = f"{green}运行中{reset}{pid_info}"
-    else:
-        service_status = f"{red}未运行{reset}"
-        
-    print(f"{bold}Aimili运行状态：{reset}")
-    print(f"  网关7928 - {gateway_status}")
-    print(f"  Aimili   - {service_status}")
+    gateway_status = f"{green}[已激活]{reset}" if gateway_ok else f"{red}[未启动]{reset}"
+    backend_status = f"{green}[已激活] (PID: {pid}){reset}" if (service_ok and pid) else f"{red}[未启动]{reset}"
+    openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
+    
+    print("=======================================================")
+    print(f"               {bold}AimiliVPN 管理终端 v2.0{reset}                  ")
+    print("=======================================================")
+    print("【核心服务状态】")
+    print(f"  ● 代理网关 (Port 7928)    :  {gateway_status}")
+    print(f"  ● 管理后台 (Port {ui_port})    :  {backend_status}")
+    print(f"  ● 连接核心 (OpenVPN)       :  {openvpn_status}")
+    
+    login_ip = "127.0.0.1" if cfg.get("host") == "127.0.0.1" else "您的服务器公网IP"
+    print(f"  ● 网页登录地址            :  {yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}")
     print()
+    print("【活动节点状态】")
+    if active_ip:
+        print(f"  ● 节点 IP                 :  {active_ip}")
+        print(f"  ● 节点延迟 (直连测试)     :  {latency or '测试中...'}")
+    else:
+        print("  ● 节点状态                 :  无活动连接")
+    print("=======================================================")
 
 def start_service():
     print("正在启动 AimiliVPN 服务...", flush=True)
@@ -223,6 +328,126 @@ def uninstall_service():
         print("已取消卸载。")
         time.sleep(1)
 
+def ask_restart():
+    ans = input("配置已保存。是否立即重启服务生效？(Y/n): ").strip().lower()
+    if ans in ('', 'y', 'yes'):
+        print("正在重启 AimiliVPN 服务...", flush=True)
+        subprocess.run(["systemctl", "restart", "aimilivpn.service"])
+        print("服务已重启。")
+        time.sleep(1.5)
+
+def configure_web():
+    cfg = load_ui_cfg()
+    while True:
+        print("\033[H\033[J", end="")
+        print("=======================================================")
+        print("               网页绑定与地址后缀配置                  ")
+        print("=======================================================")
+        print(f"  [1] 切换绑定地址 (当前: {cfg.get('host', '0.0.0.0')})")
+        print(f"  [2] 修改登录后缀 (当前: {cfg.get('secret_path', '')})")
+        print("  [3] 返回主菜单")
+        print("=======================================================")
+        print("请按数字键 [1-3] 快速执行：")
+        
+        key = get_key()
+        if key == '1':
+            print("\033[H\033[J", end="")
+            print("选择网页登录绑定地址：")
+            print("  1. 仅允许本地登录 (127.0.0.1 - 更安全)")
+            print("  2. 允许公网IP登录 (0.0.0.0 - 方便远程)")
+            sel = input("请选择 (1 或 2, 默认2): ").strip()
+            if sel == '1':
+                cfg['host'] = "127.0.0.1"
+            else:
+                cfg['host'] = "0.0.0.0"
+            save_ui_cfg(cfg)
+            print(f"绑定地址已更新为: {cfg['host']}")
+            ask_restart()
+            break
+        elif key == '2':
+            print("\033[H\033[J", end="")
+            new_path = input("请输入新的网页安全登录后缀 (不可为空, 建议使用随机字母数字): ").strip()
+            if new_path:
+                cfg['secret_path'] = new_path
+                save_ui_cfg(cfg)
+                print(f"安全登录后缀已更新为: {new_path}")
+                print(f"新的访问路径为: http://{cfg['host']}:{cfg['port']}/{new_path}/")
+                ask_restart()
+            else:
+                print("输入为空，未作任何修改。")
+                time.sleep(1.5)
+            break
+        elif key == '3' or key == 'q' or key == 'ctrl+c':
+            break
+
+def configure_port():
+    cfg = load_ui_cfg()
+    print("\033[H\033[J", end="")
+    print("=======================================================")
+    print("                      管理端口配置                     ")
+    print("=======================================================")
+    print(f"当前网页管理端口为: {cfg.get('port', 8787)}")
+    try:
+        val = input("请输入新的管理端口 (1-65535, 按回车取消): ").strip()
+        if val:
+            port = int(val)
+            if 1 <= port <= 65535:
+                cfg['port'] = port
+                save_ui_cfg(cfg)
+                print(f"管理端口已更新为: {port}")
+                ask_restart()
+            else:
+                print("错误: 端口范围必须在 1 至 65535 之间。")
+                time.sleep(2)
+    except ValueError:
+        print("错误: 输入必须是数字。")
+        time.sleep(2)
+
+def configure_password():
+    cfg = load_ui_cfg()
+    while True:
+        print("\033[H\033[J", end="")
+        print("=======================================================")
+        print("                      管理密码管理                     ")
+        print("=======================================================")
+        curr_pwd = cfg.get('password', '')
+        masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
+        print(f"当前管理密码为: {masked_pwd}")
+        print("  [1] 随机重置密码 (12位随机数字，自动保存)")
+        print("  [2] 自定义管理密码")
+        print("  [3] 返回主菜单")
+        print("=======================================================")
+        print("请按数字键 [1-3] 快速执行：")
+        
+        key = get_key()
+        if key == '1':
+            print("\033[H\033[J", end="")
+            import random
+            new_pwd = "".join(random.choices("0123456789", k=12))
+            cfg['password'] = new_pwd
+            save_ui_cfg(cfg)
+            print("密码重置成功！")
+            print(f"您的全新12位安全密码为: {new_pwd}")
+            print("此密码已保存在本地，不需要重启服务，刷新浏览器即可登录。")
+            input("\n按任意键返回主菜单...")
+            break
+        elif key == '2':
+            print("\033[H\033[J", end="")
+            new_pwd = input("请输入自定义管理密码 (不可为空): ").strip()
+            if new_pwd:
+                cfg['password'] = new_pwd
+                save_ui_cfg(cfg)
+                print("密码更新成功！")
+                print(f"新的管理密码为: {new_pwd}")
+                print("刷新浏览器即可使用新密码登录。")
+                input("\n按任意键返回主菜单...")
+            else:
+                print("输入为空，未作任何修改。")
+                time.sleep(1.5)
+            break
+        elif key == '3' or key == 'q' or key == 'ctrl+c':
+            break
+
 def getch():
     fd = sys.stdin.fileno()
     try:
@@ -273,18 +498,27 @@ def main():
             update_service()
         elif cmd == "uninstall":
             uninstall_service()
+        elif cmd == "web":
+            configure_web()
+        elif cmd == "port":
+            configure_port()
+        elif cmd == "password":
+            configure_password()
         else:
-            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall")
+            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password")
         sys.exit(0)
         
     options = [
-        ("启动", start_service),
-        ("停止", stop_service),
-        ("重启", restart_service),
-        ("日志", show_logs),
-        ("更新", update_service),
-        ("卸载", uninstall_service),
-        ("退出", None)
+        ("启动服务 (ml start)", start_service),
+        ("停止服务 (ml stop)", stop_service),
+        ("重启服务 (ml restart)", restart_service),
+        ("日志监控 (ml logs)", show_logs),
+        ("网页配置 (ml web)", configure_web),
+        ("端口配置 (ml port)", configure_port),
+        ("密码管理 (ml password)", configure_password),
+        ("一键更新 (ml update)", update_service),
+        ("完全卸载 (ml uninstall)", uninstall_service),
+        ("退出终端 (exit)", None)
     ]
     
     selected_idx = 0
@@ -292,20 +526,14 @@ def main():
         print("\033[H\033[J", end="")
         print_status()
         
+        print("请使用 [↑/↓] 键选择并按回车确认，或直接输入数字键 [0-9] 快速执行：")
+        print()
         for i, (name, _) in enumerate(options):
-            cmd_hint = ""
-            if name == "启动": cmd_hint = "start"
-            elif name == "停止": cmd_hint = "stop"
-            elif name == "重启": cmd_hint = "restart"
-            elif name == "日志": cmd_hint = "logs"
-            elif name == "更新": cmd_hint = "update"
-            elif name == "卸载": cmd_hint = "uninstall"
-            elif name == "退出": cmd_hint = "exit"
-            
+            num_char = str((i + 1) % 10)
             if i == selected_idx:
-                print(f" \033[1;32m> ml {cmd_hint:<9} - {name}\033[0m")
+                print(f" \033[1;32m> [{num_char}] {name}\033[0m")
             else:
-                print(f"   ml {cmd_hint:<9} - {name}")
+                print(f"   [{num_char}] {name}")
         print()
         
         try:
@@ -318,6 +546,20 @@ def main():
         elif key == 'down':
             selected_idx = (selected_idx + 1) % len(options)
         elif key == 'enter':
+            _, func = options[selected_idx]
+            if func is None:
+                break
+            print("\033[H\033[J", end="")
+            func()
+            if func in (start_service, stop_service, restart_service):
+                continue
+            break
+        elif key in ('1', '2', '3', '4', '5', '6', '7', '8', '9', '0'):
+            mapping = {
+                '1': 0, '2': 1, '3': 2, '4': 3, '5': 4,
+                '6': 5, '7': 6, '8': 7, '9': 8, '0': 9
+            }
+            selected_idx = mapping[key]
             _, func = options[selected_idx]
             if func is None:
                 break
