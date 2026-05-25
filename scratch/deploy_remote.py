@@ -55,13 +55,18 @@ def deploy(host, port, username, password, files_to_upload):
         ssh.close()
 
 if __name__ == "__main__":
+    import json
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "服务器连接配置_不要上传到GITHUB.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    
     deploy(
-        "107.175.230.117", 
-        22, 
-        "root", 
-        "9Qet0EcR6P4h1n8LPg", 
+        config["host"], 
+        config["port"], 
+        config["username"], 
+        config["password"], 
         [
-            (r"c:\Users\Hmily\Desktop\AimiliVPN-OpenSource\vpngate_manager.py", "/opt/aimilivpn/vpngate_manager.py"),
-            (r"c:\Users\Hmily\Desktop\AimiliVPN-OpenSource\install.sh", "/opt/aimilivpn/install.sh")
+            (os.path.join(os.path.dirname(os.path.dirname(__file__)), "vpngate_manager.py"), "/opt/aimilivpn/vpngate_manager.py"),
+            (os.path.join(os.path.dirname(os.path.dirname(__file__)), "install.sh"), "/opt/aimilivpn/install.sh")
         ]
     )

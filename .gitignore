@@ -25,3 +25,7 @@ logs/
 .vscode/
 .idea/
 .gemini/
+
+# Scratch and test files containing credentials
+scratch/
+*不要上传到GITHUB*

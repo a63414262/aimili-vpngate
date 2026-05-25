@@ -73,6 +73,46 @@ def read_json(path: Path, default: Any) -> Any:
     except (OSError, json.JSONDecodeError):
         return default
 
+import hashlib
+import random
+
+def generate_random_password() -> str:
+    return "".join(random.choices("0123456789", k=12))
+
+def load_ui_config() -> dict[str, Any]:
+    auth_file = DATA_DIR / "ui_auth.json"
+    config = {
+        "secret_path": "EJsW2EeBo9lY",
+        "password": "",
+        "host": "0.0.0.0",
+        "port": 8787
+    }
+    updated = False
+    if auth_file.exists():
+        try:
+            data = json.loads(auth_file.read_text(encoding="utf-8"))
+            for key, val in data.items():
+                config[key] = val
+        except Exception:
+            pass
+    
+    if not config.get("password"):
+        config["password"] = generate_random_password()
+        updated = True
+        
+    if not auth_file.exists() or updated:
+        try:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            auth_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+            
+    return config
+
+def get_session_token(password: str) -> str:
+    salt = "aimilivpn_secure_salt_2026"
+    return hashlib.sha256((password + salt).encode("utf-8")).hexdigest()
+
 def cleanup_old_logs(logs_dir: Path) -> None:
     try:
         now = time.time()
