@@ -1708,6 +1708,25 @@ function render(){
   const activeNodeInfo = state.active_openvpn_node_id ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${state.active_openvpn_node_id}</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
   
+  // Update proxy test status card based on background checks
+  const pBadge = $("proxy_status_badge");
+  const pIpVal = $("proxy_ip_val");
+  const pLatVal = $("proxy_latency_val");
+  if (state.proxy_ok !== undefined) {
+    if (state.proxy_ok) {
+      pBadge.className = "badge available";
+      pBadge.textContent = "可用";
+      pIpVal.textContent = state.proxy_ip || "-";
+      const latencyClass = getLatencyClass(state.proxy_latency_ms);
+      pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;
+    } else {
+      pBadge.className = "badge unavailable";
+      pBadge.textContent = "不可用";
+      pIpVal.textContent = "-";
+      pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;" title="${esc(state.proxy_error)}">${esc(state.proxy_error || "连接失败")}</span>`;
+    }
+  }
+
   $("rows").innerHTML=shown.map(n=>{
     const isAct = n.active;
     const badgeClass = isAct ? 'current-badge' : (n.probe_status || 'not_checked');
@@ -1842,7 +1861,28 @@ setInterval(load,10000);
 </script>
 </body></html>"""
 
-def test_local_proxy() -> dict[str, Any]:
+def check_proxy_health() -> dict[str, Any]:
+    # 1. 检测代理服务端口是否在监听
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1.5)
+    try:
+        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
+        s.close()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"代理服务未运行 (端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e})"
+        }
+
+    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
+    tun_path = Path("/sys/class/net/tun0")
+    if sys.platform.startswith("linux") and not tun_path.exists():
+        return {
+            "ok": False,
+            "error": "VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+        }
+
+    # 3. 尝试通过代理请求外网接口
     proxy_url = f"http://127.0.0.1:{LOCAL_PROXY_PORT}"
     proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
     opener = urllib.request.build_opener(proxy_handler)
@@ -1867,7 +1907,41 @@ def test_local_proxy() -> dict[str, Any]:
                 latency = int((time.perf_counter() - t0) * 1000)
                 return {"ok": True, "ip": ip, "latency_ms": latency}
         except Exception as e2:
-            return {"ok": False, "error": f"{e} / {e2}"}
+            err_msg = str(e)
+            if "Connection refused" in err_msg or "Failed to receive SOCKS5" in err_msg:
+                return {
+                    "ok": False,
+                    "error": "代理中转握手失败 (OpenVPN 已连接，但无法建立外部 TCP 握手)"
+                }
+            return {
+                "ok": False,
+                "error": f"VPN 节点无外网访问权限 (请求超时或线路被拦截，报错: {e})"
+            }
+
+def background_proxy_checker() -> None:
+    time.sleep(2)
+    while True:
+        try:
+            res = check_proxy_health()
+            if res["ok"]:
+                set_state(
+                    proxy_ok=True,
+                    proxy_ip=res["ip"],
+                    proxy_latency_ms=res["latency_ms"],
+                    proxy_error=""
+                )
+            else:
+                error_msg = res.get("error", "未知错误")
+                print(f"[警告] 7928 端口本地代理当前不可用！原因: {error_msg}", flush=True)
+                set_state(
+                    proxy_ok=False,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
+                    proxy_error=error_msg
+                )
+        except Exception as e:
+            print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
+        time.sleep(30)
 
 class Handler(BaseHTTPRequestHandler):
     def get_secret_path(self) -> str:
@@ -1984,7 +2058,21 @@ class Handler(BaseHTTPRequestHandler):
                 length = parse_int(self.headers.get("Content-Length"))
                 if length > 0:
                     self.rfile.read(length)
-                result = test_local_proxy()
+                result = check_proxy_health()
+                if result["ok"]:
+                    set_state(
+                        proxy_ok=True,
+                        proxy_ip=result["ip"],
+                        proxy_latency_ms=result["latency_ms"],
+                        proxy_error=""
+                    )
+                else:
+                    set_state(
+                        proxy_ok=False,
+                        proxy_ip="-",
+                        proxy_latency_ms=0,
+                        proxy_error=result.get("reason", "未知错误")
+                    )
                 self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2030,6 +2118,7 @@ def main() -> None:
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
     threading.Thread(target=collector_loop, daemon=True).start()
+    threading.Thread(target=background_proxy_checker, daemon=True).start()
     
     print(f"UI: http://{UI_HOST}:{UI_PORT}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)

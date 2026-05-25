@@ -104,6 +104,7 @@ show_help() {
     echo "  ml restart    - 重启服务"
     echo "  ml logs       - 查看实时服务运行日志"
     echo "  ml status     - 查看运行状态"
+    echo "  ml update     - 一键更新源码及重启服务"
     echo "  ml uninstall  - 卸载服务及清除源码文件"
 }
 
@@ -131,6 +132,24 @@ case "${1:-}" in
     logs)
         echo "正在查看 AimiliVPN 日志 (按 Ctrl+C 退出)..."
         journalctl -u aimilivpn.service -f -n 50
+        ;;
+    update)
+        echo "正在一键更新 AimiliVPN 至最新版本并清理旧代码..."
+        cd "${INSTALL_DIR}"
+        git fetch --all
+        BRANCH=$(git symbolic-ref --short -q HEAD || echo "main")
+        if git reset --hard "origin/${BRANCH}"; then
+            echo "代码拉取成功，正在执行升级配置..."
+            if bash "${INSTALL_DIR}/install.sh"; then
+                echo "AimiliVPN 一键更新与清理完成！"
+            else
+                echo "错误: 升级配置执行失败。"
+                exit 1
+            fi
+        else
+            echo "错误: 无法从 GitHub 拉取最新代码，请检查网络。"
+            exit 1
+        fi
         ;;
     uninstall)
         echo "正在完全卸载 AimiliVPN..."
