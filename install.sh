@@ -255,31 +255,38 @@ def check_port_listening(port):
     except Exception:
         return False
 
-def check_service_active(service_name="aimilivpn.service"):
-    try:
-        res = subprocess.run(["systemctl", "is-active", service_name], capture_output=True, text=True, timeout=2)
-        return res.stdout.strip() == "active"
-    except Exception:
-        return False
-
-def check_openvpn_process():
-    try:
-        res = subprocess.run(["pgrep", "openvpn"], capture_output=True, text=True, timeout=2)
-        return bool(res.stdout.strip())
-    except Exception:
-        return False
-
 def get_service_pid(service_name="aimilivpn.service"):
     try:
-        res = subprocess.run(["systemctl", "show", service_name, "--property=MainPID"], capture_output=True, text=True, timeout=2)
-        out = res.stdout.strip()
-        if out.startswith("MainPID="):
-            pid = out.split("=")[1]
-            if pid and pid != "0":
-                return pid
+        for pid_dir in os.listdir('/proc'):
+            if pid_dir.isdigit():
+                try:
+                    with open(os.path.join('/proc', pid_dir, 'cmdline'), 'r') as f:
+                        cmd = f.read()
+                        if 'vpngate_manager.py' in cmd:
+                            return pid_dir
+                except Exception:
+                    continue
     except Exception:
         pass
     return None
+
+def check_service_active(service_name="aimilivpn.service"):
+    return get_service_pid(service_name) is not None
+
+def check_openvpn_process():
+    try:
+        for pid_dir in os.listdir('/proc'):
+            if pid_dir.isdigit():
+                try:
+                    with open(os.path.join('/proc', pid_dir, 'cmdline'), 'r') as f:
+                        cmd = f.read().split('\x00')[0]
+                        if 'openvpn' in cmd:
+                            return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
 
 def get_display_width(s):
     import re
@@ -629,6 +636,25 @@ def getch_timeout(timeout=1.0):
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
+def get_status_state():
+    cfg = load_ui_cfg()
+    state = load_state()
+    return (
+        cfg.get("port", 8787),
+        cfg.get("secret_path", "EJsW2EeBo9lY"),
+        cfg.get("username", "admin"),
+        cfg.get("password", ""),
+        cfg.get("host", "0.0.0.0"),
+        state.get("is_connecting", False),
+        state.get("active_openvpn_node_id", ""),
+        state.get("last_check_message", ""),
+        state.get("active_node_latency", ""),
+        check_port_listening(7928),
+        check_service_active("aimilivpn.service"),
+        check_openvpn_process(),
+        get_service_pid("aimilivpn.service")
+    )
+
 def main():
     if os.geteuid() != 0:
         print("错误: 必须以 root 权限运行此命令。")
@@ -644,11 +670,15 @@ def main():
             restart_service()
         elif cmd == "status":
             try:
+                last_state = None
                 while True:
-                    print("\033[H\033[J", end="")
-                    print_status()
-                    print("\n提示: 正在实时监控状态，每 2 秒自动刷新。按 Ctrl+C 退出...")
-                    time.sleep(2)
+                    current_state = get_status_state()
+                    if current_state != last_state:
+                        print("\033[H\033[J", end="")
+                        print_status()
+                        print("\n提示: 正在实时监控状态，自动更新。按 Ctrl+C 退出...")
+                        last_state = current_state
+                    time.sleep(0.5)
             except KeyboardInterrupt:
                 pass
         elif cmd == "logs":
@@ -680,26 +710,30 @@ def main():
         '0': ("退出终端", None)
     }
     
+    last_state = None
     while True:
-        print("\033[H\033[J", end="")
-        print_status()
-        
-        bold = "\033[1m"
-        reset = "\033[0m"
-        green = "\033[1;32m"
-        
-        print(f"【{bold}终端指令菜单栏{reset}】")
-        for key in sorted(options.keys()):
-            if key == '0':
-                continue
-            name, _ = options[key]
-            print(f"  {green}[{key}]{reset} {name}")
-        print(f"  {green}[0]{reset} {options['0'][0]}")
-        print("=======================================================")
-        print("请直接输入数字键 [0-9] 快速选择执行：", end="", flush=True)
-        
+        current_state = get_status_state()
+        if current_state != last_state:
+            print("\033[H\033[J", end="")
+            print_status()
+            
+            bold = "\033[1m"
+            reset = "\033[0m"
+            green = "\033[1;32m"
+            
+            print(f"【{bold}终端指令菜单栏{reset}】")
+            for key in sorted(options.keys()):
+                if key == '0':
+                    continue
+                name, _ = options[key]
+                print(f"  {green}[{key}]{reset} {name}")
+            print(f"  {green}[0]{reset} {options['0'][0]}")
+            print("=======================================================")
+            print("请直接输入数字键 [0-9] 快速选择执行：", end="", flush=True)
+            last_state = current_state
+            
         try:
-            key = getch_timeout(1.0)
+            key = getch_timeout(0.5)
         except KeyboardInterrupt:
             break
             
@@ -709,6 +743,9 @@ def main():
         if key == '\x03':
             break
             
+        # Reset last_state to force redraw after any key input
+        last_state = None
+        
         if key in options:
             name, func = options[key]
             if func is None:
