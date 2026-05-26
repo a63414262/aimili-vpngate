@@ -8,12 +8,15 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import threading
 from pathlib import Path
 from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "vpngate_data"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
+
+ip_cache_lock = threading.RLock()
 
 COUNTRY_TRANSLATIONS = {
     "Japan": "日本",
@@ -191,8 +194,8 @@ def get_physical_interface() -> str | None:
 
 def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
     started = time.time()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
         if dev:
             try:
@@ -200,10 +203,14 @@ def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
             except OSError:
                 pass
         s.connect((host, port))
-        s.close()
         return max(1, int((time.time() - started) * 1000))
     except OSError:
         return 0
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
     dev = get_physical_interface()
@@ -269,15 +276,19 @@ def check_and_fix_dns() -> None:
 
     network_ok = False
     for ip in ["8.8.8.8", "1.1.1.1"]:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(2)
             s.connect((ip, 53))
-            s.close()
             network_ok = True
             break
         except Exception:
             pass
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     if not network_ok:
         return
@@ -294,24 +305,29 @@ def check_and_fix_dns() -> None:
             print(f"[dns_heal] Failed to write DNS fallback: {e}", flush=True)
 
 def load_ip_cache() -> dict[str, dict[str, Any]]:
-    try:
-        if IP_CACHE_FILE.exists():
-            return json.loads(IP_CACHE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
+    with ip_cache_lock:
+        try:
+            if IP_CACHE_FILE.exists():
+                return json.loads(IP_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
 
 def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
-    try:
-        DATA_DIR.mkdir(exist_ok=True)
-        IP_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    with ip_cache_lock:
+        try:
+            DATA_DIR.mkdir(exist_ok=True)
+            IP_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
+    # 1. Read cache thread-safely
+    with ip_cache_lock:
+        cache = load_ip_cache()
+
     ips_to_query = []
     now = time.time()
-    cache = load_ip_cache()
 
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host")
@@ -332,6 +348,8 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     if not ips_to_query:
         return
 
+    # 2. Perform HTTP query outside lock
+    new_entries = {}
     chunk_size = 100
     for i in range(0, len(ips_to_query), chunk_size):
         chunk = ips_to_query[i : i + chunk_size]
@@ -370,7 +388,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
 
                     loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
 
-                    cache[query_ip] = {
+                    new_entries[query_ip] = {
                         "owner": item.get("org") or item.get("isp") or "",
                         "asn": item.get("as") or "",
                         "as_name": item.get("asname") or "",
@@ -382,12 +400,20 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         except Exception as e:
             print(f"[enrich_ip_info] Query failed: {e}", flush=True)
 
-    save_ip_cache(cache)
+    if not new_entries:
+        return
 
+    # 3. Save cache thread-safely (reload & update to avoid overwrite of concurrent queries)
+    with ip_cache_lock:
+        cache = load_ip_cache()
+        cache.update(new_entries)
+        save_ip_cache(cache)
+
+    # 4. Enrich nodes with newly queried info
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host")
-        if ip in cache:
-            cached = cache[ip]
+        if ip in new_entries:
+            cached = new_entries[ip]
             node["owner"] = cached.get("owner", "")
             node["asn"] = cached.get("asn", "")
             node["as_name"] = cached.get("as_name", "")

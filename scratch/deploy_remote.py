@@ -77,6 +77,7 @@ if __name__ == "__main__":
         [
             (os.path.join(os.path.dirname(os.path.dirname(__file__)), "vpngate_manager.py"), "/opt/aimilivpn/vpngate_manager.py"),
             (os.path.join(os.path.dirname(os.path.dirname(__file__)), "vpn_utils.py"), "/opt/aimilivpn/vpn_utils.py"),
+            (os.path.join(os.path.dirname(os.path.dirname(__file__)), "proxy_server.py"), "/opt/aimilivpn/proxy_server.py"),
             (os.path.join(os.path.dirname(os.path.dirname(__file__)), "install.sh"), "/opt/aimilivpn/install.sh")
         ]
     )

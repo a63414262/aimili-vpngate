@@ -96,34 +96,35 @@ def generate_random_password() -> str:
             return pwd
 
 def load_ui_config() -> dict[str, Any]:
-    auth_file = DATA_DIR / "ui_auth.json"
-    config = {
-        "secret_path": "EJsW2EeBo9lY",
-        "password": "",
-        "host": "0.0.0.0",
-        "port": 8787
-    }
-    updated = False
-    if auth_file.exists():
-        try:
-            data = json.loads(auth_file.read_text(encoding="utf-8"))
-            for key, val in data.items():
-                config[key] = val
-        except Exception:
-            pass
-    
-    if not config.get("password"):
-        config["password"] = generate_random_password()
-        updated = True
+    with lock:
+        auth_file = DATA_DIR / "ui_auth.json"
+        config = {
+            "secret_path": "EJsW2EeBo9lY",
+            "password": "",
+            "host": "0.0.0.0",
+            "port": 8787
+        }
+        updated = False
+        if auth_file.exists():
+            try:
+                data = json.loads(auth_file.read_text(encoding="utf-8"))
+                for key, val in data.items():
+                    config[key] = val
+            except Exception:
+                pass
         
-    if not auth_file.exists() or updated:
-        try:
-            DATA_DIR.mkdir(exist_ok=True, parents=True)
-            auth_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        if not config.get("password"):
+            config["password"] = generate_random_password()
+            updated = True
             
-    return config
+        if not auth_file.exists() or updated:
+            try:
+                DATA_DIR.mkdir(exist_ok=True, parents=True)
+                auth_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+                
+        return config
 
 def get_session_token(password: str) -> str:
     salt = "aimilivpn_secure_salt_2026"
@@ -3095,14 +3096,18 @@ def main() -> None:
     gateway_ready = False
     for _ in range(30):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
         try:
+            s.settimeout(0.5)
             s.connect((LOCAL_PROXY_HOST, LOCAL_PROXY_PORT))
-            s.close()
             gateway_ready = True
             break
         except Exception:
             time.sleep(0.5)
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
             
     if gateway_ready:
         print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)

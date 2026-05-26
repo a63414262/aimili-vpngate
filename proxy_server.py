@@ -4,6 +4,7 @@ import select
 import socket
 import threading
 import urllib.parse
+import time
 from typing import Any
 
 def parse_int(value: Any) -> int:
@@ -156,5 +157,9 @@ def start_proxy_server(host: str, port: int) -> None:
         return
 
     while True:
-        client, address = server.accept()
-        threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
+        try:
+            client, address = server.accept()
+            threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
+        except Exception as e:
+            print(f"[ERROR] Proxy accept failed: {e}", flush=True)
+            time.sleep(0.5)
