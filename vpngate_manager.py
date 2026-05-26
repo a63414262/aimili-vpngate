@@ -99,6 +99,7 @@ def load_ui_config() -> dict[str, Any]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
         config = {
+            "username": "admin",
             "secret_path": "EJsW2EeBo9lY",
             "password": "",
             "host": "0.0.0.0",
@@ -126,9 +127,9 @@ def load_ui_config() -> dict[str, Any]:
                 
         return config
 
-def get_session_token(password: str) -> str:
+def get_session_token(password: str, username: str = "admin") -> str:
     salt = "aimilivpn_secure_salt_2026"
-    return hashlib.sha256((password + salt).encode("utf-8")).hexdigest()
+    return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
 def cleanup_old_logs(logs_dir: Path) -> None:
     try:
@@ -1122,13 +1123,19 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         </svg>
       </div>
       <h2 class="login-title">AimiliVPN</h2>
-      <p class="login-subtitle">请配置或输入您的管理密码以继续</p>
+      <p class="login-subtitle">请输入您的管理账号和安全密码以继续</p>
       
       <form id="login_form" onsubmit="handleLogin(event)">
         <div class="form-group">
+          <label class="form-label" for="username">管理账号</label>
+          <div class="input-wrapper">
+            <input type="text" id="username" class="input-field" placeholder="请输入管理账号" required autocomplete="username" value="admin">
+          </div>
+        </div>
+        <div class="form-group" style="margin-top: 16px;">
           <label class="form-label" for="password">安全密码</label>
           <div class="input-wrapper">
-            <input type="password" id="password" class="input-field" placeholder="请输入12位安全密码" required autocomplete="current-password">
+            <input type="password" id="password" class="input-field" placeholder="请输入安全密码" required autocomplete="current-password">
           </div>
           <div id="error_text" class="error-message"></div>
         </div>
@@ -1143,6 +1150,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   <script>
     async function handleLogin(e) {
       e.preventDefault();
+      const uname = document.getElementById("username").value;
       const pwd = document.getElementById("password").value;
       const errorText = document.getElementById("error_text");
       const submitBtn = document.getElementById("submit_btn");
@@ -1155,14 +1163,14 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         const response = await fetch("./api/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password: pwd })
+          body: JSON.stringify({ username: uname, password: pwd })
         });
         
         const data = await response.json();
         if (response.ok && data.ok) {
           window.location.reload();
         } else {
-          errorText.textContent = data.error || "密码不正确，请重新输入";
+          errorText.textContent = data.error || "账号或密码不正确，请重新输入";
           errorText.style.display = "block";
           submitBtn.disabled = false;
           submitBtn.querySelector("span").textContent = "登录";
@@ -2871,6 +2879,7 @@ class Handler(BaseHTTPRequestHandler):
     def is_authorized(self) -> bool:
         ui_cfg = load_ui_config()
         pwd = ui_cfg.get("password")
+        uname = ui_cfg.get("username", "admin")
         if not pwd:
             return True
         
@@ -2883,7 +2892,7 @@ class Handler(BaseHTTPRequestHandler):
                     k, v = item.split("=", 1)
                     cookies[k.strip()] = v.strip()
         
-        expected_token = get_session_token(pwd)
+        expected_token = get_session_token(pwd, uname)
         return cookies.get("session") == expected_token
 
     def validate_path(self) -> str:
@@ -2985,12 +2994,14 @@ class Handler(BaseHTTPRequestHandler):
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 input_pwd = str(payload.get("password") or "")
+                input_uname = str(payload.get("username") or "")
                 
                 ui_cfg = load_ui_config()
                 expected_pwd = ui_cfg.get("password", "")
+                expected_uname = ui_cfg.get("username", "admin")
                 
-                if expected_pwd and input_pwd == expected_pwd:
-                    token = get_session_token(expected_pwd)
+                if expected_pwd and input_pwd == expected_pwd and input_uname == expected_uname:
+                    token = get_session_token(expected_pwd, expected_uname)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     secret_path = self.get_secret_path()
@@ -2999,7 +3010,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
                 else:
-                    self.send_json({"ok": False, "error": "密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
+                    self.send_json({"ok": False, "error": "用户名或密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

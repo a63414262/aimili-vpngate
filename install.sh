@@ -329,6 +329,10 @@ def print_status():
     
     login_ip = "127.0.0.1" if cfg.get("host") == "127.0.0.1" else get_public_ip()
     print(format_line("网页登录地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}"))
+    print(format_line("网页管理账号", cfg.get("username", "admin")))
+    curr_pwd = cfg.get("password", "")
+    masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
+    print(format_line("网页管理密码", masked_pwd))
     print()
     print("【活动节点状态】")
     if is_connecting:
@@ -486,32 +490,52 @@ def configure_port():
         print("错误: 输入必须是数字。")
         time.sleep(2)
 
-def configure_password():
+def configure_credentials():
     cfg = load_ui_cfg()
     while True:
         print("\033[H\033[J", end="")
         print("=======================================================")
-        print("                      管理密码管理                     ")
+        print("                    管理账号密码管理                   ")
         print("=======================================================")
+        curr_uname = cfg.get('username', 'admin')
         curr_pwd = cfg.get('password', '')
         masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
-        print(f"当前管理密码为: {masked_pwd}")
-        print("  [1] 随机重置密码 (12位数字+字母+符号)")
-        print("  [2] 返回主菜单")
+        print(f"当前管理账号: {curr_uname}")
+        print(f"当前管理密码: {masked_pwd}")
+        print("  [1] 自定义修改账号密码")
+        print("  [2] 随机重置安全密码")
+        print("  [3] 返回主菜单")
         print("=======================================================")
-        print("请直接输入数字键 [1-2] 快速执行：", end="", flush=True)
+        print("请直接输入数字键 [1-3] 快速执行：", end="", flush=True)
         
         key = getch()
         if key == '1':
             print("\033[H\033[J", end="")
+            new_uname = input("请输入新管理账号 (回车默认 admin): ").strip()
+            if not new_uname:
+                new_uname = "admin"
+            new_pwd = input("请输入新管理密码 (不能为空): ").strip()
+            if not new_pwd:
+                print("错误: 密码不能为空！")
+                time.sleep(2)
+                continue
+            cfg['username'] = new_uname
+            cfg['password'] = new_pwd
+            save_ui_cfg(cfg)
+            print("账号密码修改成功！")
+            print(f"您的新管理账号: {new_uname}")
+            print(f"您的新管理密码: {new_pwd}")
+            input("\n按任意键返回菜单...")
+        elif key == '2':
+            print("\033[H\033[J", end="")
             new_pwd = generate_random_password()
             cfg['password'] = new_pwd
             save_ui_cfg(cfg)
-            print("密码重置成功！")
+            print("密码随机重置成功！")
             print(f"您的全新12位安全密码为: {new_pwd}")
-            print("此密码已保存在本地，不需要重启服务，刷新浏览器即可登录。")
-            input("\n按任意键返回密码菜单...")
-        elif key == '2' or key == 'q' or key == '\x03':
+            print("密码已保存在本地，不需要重启服务，刷新浏览器即可登录。")
+            input("\n按任意键返回菜单...")
+        elif key == '3' or key == 'q' or key == '\x03':
             break
 
 def getch():
@@ -589,7 +613,7 @@ def main():
         elif cmd == "port":
             configure_port()
         elif cmd == "password":
-            configure_password()
+            configure_credentials()
         else:
             print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password")
         sys.exit(0)
@@ -601,7 +625,7 @@ def main():
         '4': ("日志监控 (ml logs)", show_logs),
         '5': ("网页配置 (ml web)", configure_web),
         '6': ("端口配置 (ml port)", configure_port),
-        '7': ("密码管理 (ml password)", configure_password),
+        '7': ("账号密码 (ml password)", configure_credentials),
         '8': ("一键更新 (ml update)", update_service),
         '9': ("完全卸载 (ml uninstall)", uninstall_service),
         '0': ("退出终端", None)
@@ -645,7 +669,7 @@ def main():
             func()
             if func in (start_service, stop_service, restart_service):
                 continue
-            if func in (configure_web, configure_port, configure_password, show_logs, update_service):
+            if func in (configure_web, configure_port, configure_credentials, show_logs, update_service):
                 continue
             input("\n操作已完成，按回车键返回主菜单...")
 
@@ -654,7 +678,98 @@ if __name__ == "__main__":
 EOF
 chmod +x /usr/bin/ml
 
-# 7. Start service
+# 7. Configure Custom parameters (First-time installation check)
+AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
+mkdir -p "${INSTALL_DIR}/vpngate_data"
+
+if [ ! -f "$AUTH_FILE" ]; then
+    echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）？${PLAIN}"
+    read -p "是否自定义配置？[y/N]: " is_custom
+    
+    # Initialize defaults
+    UI_PORT=8787
+    # generate random secret suffix (12 chars alphanumeric)
+    SECRET_PATH=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
+    # generate random password
+    UI_PASSWORD=$(python3 -c "
+import random, string
+symbols = '!@#\$%^&*'
+chars = string.ascii_letters + string.digits + symbols
+while True:
+    pwd = ''.join(random.choices(chars, k=12))
+    if any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd) and any(c in symbols for c in pwd):
+        print(pwd)
+        break
+")
+    UI_USERNAME="admin"
+
+    if [[ "$is_custom" =~ ^[Yy]$ ]]; then
+        # Step-by-step custom inputs
+        # 1. Custom port
+        while true; do
+            read -p "请输入自定义管理端口 [1-65535, 默认 8787]: " input_port
+            if [ -z "$input_port" ]; then
+                UI_PORT=8787
+                break
+            fi
+            if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+                UI_PORT=$input_port
+                break
+            else
+                echo -e "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}"
+            fi
+        done
+        
+        # 2. Custom suffix
+        while true; do
+            read -p "请输入网页登录自定义安全后缀 [字母与数字组合, 默认随机]: " input_suffix
+            if [ -z "$input_suffix" ]; then
+                break
+            fi
+            if [[ "$input_suffix" =~ ^[A-Za-z0-9]+$ ]]; then
+                SECRET_PATH=$input_suffix
+                break
+            else
+                echo -e "${RED}输入错误: 后缀仅能由英文字母和数字组成！${PLAIN}"
+            fi
+        done
+        
+        # 3. Custom login username and password
+        read -p "请输入登录账号 [默认 admin]: " input_user
+        if [ -n "$input_user" ]; then
+            UI_USERNAME=$input_user
+        fi
+        
+        while true; do
+            read -p "请输入登录密码 [默认随机生成, 建议包含字母、数字与符号]: " input_pass
+            if [ -z "$input_pass" ]; then
+                break
+            fi
+            if [ ${#input_pass} -ge 4 ]; then
+                UI_PASSWORD=$input_pass
+                break
+            else
+                echo -e "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"
+            fi
+        done
+    fi
+
+    # Write config JSON
+    python3 -c "
+import json
+cfg = {
+    'host': '0.0.0.0',
+    'port': int('$UI_PORT'),
+    'secret_path': '$SECRET_PATH',
+    'username': '$UI_USERNAME',
+    'password': '$UI_PASSWORD'
+}
+with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+"
+fi
+
+# 8. Start service
 echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
 systemctl restart aimilivpn.service || true
 
@@ -694,11 +809,15 @@ if [ -z "$ACTIVE_ID" ]; then
 fi
 
 SECRET_PATH="EJsW2EeBo9lY"
+USERNAME="admin"
 PASSWORD="未配置"
+UI_PORT=8787
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 if [ -f "$AUTH_FILE" ]; then
-    SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE'))['secret_path'])" 2>/dev/null || echo "EJsW2EeBo9lY")
-    PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE'))['password'])" 2>/dev/null || echo "未配置")
+    SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
+    USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', 'admin'))" 2>/dev/null || echo "admin")
+    PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
+    UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
 fi
 
 # Get VPS public IP
@@ -709,7 +828,8 @@ echo -n "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
 echo -e "\n${GREEN}==========================================================${PLAIN}"
 echo -e "${GREEN}             AimiliVPN 源码一键部署已完成！${PLAIN}"
 echo -e "${GREEN}==========================================================${PLAIN}"
-echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:8787/${SECRET_PATH}/${PLAIN}"
+echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/${PLAIN}"
+echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
 echo -e " --------------------------------------------------------"
