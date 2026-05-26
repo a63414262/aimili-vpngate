@@ -28,7 +28,8 @@ def run_commands(host, port, username, password, commands):
 
 if __name__ == "__main__":
     commands = [
-        "grep -n -C 5 \"def active_node_pinger\" /opt/aimilivpn/vpngate_manager.py"
+        "cat /opt/aimilivpn/vpngate_data/state.json",
+        "ml status"
     ]
     import json
     import os

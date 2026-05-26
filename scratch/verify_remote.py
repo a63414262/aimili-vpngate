@@ -10,19 +10,26 @@ def run_verification(host, port, username, password):
         print("Connected successfully!\n")
 
         commands = [
-            # Check current daemon state (should be disconnected, since we just restarted it)
-            "python3 -c 'import json, hashlib, urllib.request; cfg = json.load(open(\"/opt/aimilivpn/vpngate_data/ui_auth.json\")); token = hashlib.sha256((cfg.get(\"password\", \"\") + \"aimilivpn_secure_salt_2026\").encode()).hexdigest(); req = urllib.request.Request(\"http://127.0.0.1:8787/EJsW2EeBo9lY/api/nodes\", headers={\"Cookie\": f\"session={token}\"}); res = json.loads(urllib.request.urlopen(req).read().decode()); print(json.dumps(res[\"state\"], indent=2))'",
+            # 1. Delete ui_auth.json to force first-time password generation
+            "rm -f /opt/aimilivpn/vpngate_data/ui_auth.json",
             
-            # Wait 15 seconds to let the automatic node connection/pinger run
+            # 2. Restart service
+            "systemctl restart aimilivpn",
+            "sleep 4",
+            
+            # 3. Print the newly generated complex password
+            "cat /opt/aimilivpn/vpngate_data/ui_auth.json",
+            
+            # 4. Wait for automatic connection to complete
             "sleep 15",
             
-            # Query state again to see if active node ID is populated and active_node_latency is set
+            # 5. Query state JSON using authenticated call
             "python3 -c 'import json, hashlib, urllib.request; cfg = json.load(open(\"/opt/aimilivpn/vpngate_data/ui_auth.json\")); token = hashlib.sha256((cfg.get(\"password\", \"\") + \"aimilivpn_secure_salt_2026\").encode()).hexdigest(); req = urllib.request.Request(\"http://127.0.0.1:8787/EJsW2EeBo9lY/api/nodes\", headers={\"Cookie\": f\"session={token}\"}); res = json.loads(urllib.request.urlopen(req).read().decode()); print(json.dumps(res[\"state\"], indent=2))'",
             
-            # Run ml status to check CLI output
+            # 6. Run ml status to check CLI output (with region and latency)
             "ml status",
             
-            # Check journal logs for any pinger errors
+            # 7. Check journal logs
             "journalctl -u aimilivpn --no-pager -n 40"
         ]
 

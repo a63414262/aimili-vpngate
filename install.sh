@@ -108,6 +108,21 @@ import termios
 INSTALL_DIR = "/opt/aimilivpn"
 LOG_FILE = "/opt/aimilivpn/vpngate_data/vpngate.log"
 
+def generate_random_password():
+    import random
+    import string
+    symbols = "!@#$%^&*"
+    chars = string.ascii_letters + string.digits + symbols
+    while True:
+        pwd = "".join(random.choices(chars, k=12))
+        if any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd) and any(c in symbols for c in pwd):
+            return pwd
+
+def generate_random_suffix():
+    import random
+    import string
+    return "".join(random.choices(string.ascii_letters + string.digits, k=12))
+
 def load_ui_cfg():
     import json
     path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
@@ -147,23 +162,25 @@ def load_state():
             pass
     return state
 
-def get_active_node_ip():
+def get_active_node_info():
     import json
     path = "/opt/aimilivpn/vpngate_data/nodes.json"
     state = load_state()
     active_id = state.get("active_openvpn_node_id")
     if not active_id:
-        return None
+        return None, None
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 nodes = json.load(f)
                 for n in nodes:
                     if n.get("id") == active_id:
-                        return n.get("ip") or n.get("remote_host")
+                        ip = n.get("ip") or n.get("remote_host")
+                        loc = n.get("location") or n.get("country") or "未知"
+                        return ip, loc
         except Exception:
             pass
-    return None
+    return None, None
 
 def ping_ip(ip):
     if not ip:
@@ -261,7 +278,7 @@ def print_status():
     openvpn_ok = check_openvpn_process()
     pid = get_service_pid("aimilivpn.service")
     
-    active_ip = get_active_node_ip()
+    active_ip, active_loc = get_active_node_info()
     latency = state.get("active_node_latency", "测试中...") if active_ip else "无活动连接"
     
     green = "\033[1;32m"
@@ -294,6 +311,7 @@ def print_status():
         print(f"  ● 节点状态                 :  {yellow}正在连接到节点 {state.get('active_openvpn_node_id') or ''} (加载服务中...){reset}")
     elif active_ip:
         print(f"  ● 节点 IP                 :  {active_ip}")
+        print(f"  ● 节点地区                 :  {active_loc}")
         print(f"  ● 节点延迟 (直连测试)     :  {latency}")
     else:
         print("  ● 节点状态                 :  无活动连接")
@@ -387,7 +405,7 @@ def configure_web():
         print("               网页绑定与地址后缀配置                  ")
         print("=======================================================")
         print(f"  [1] 切换绑定地址 (当前: {cfg.get('host', '0.0.0.0')})")
-        print(f"  [2] 修改登录后缀 (当前: {cfg.get('secret_path', '')})")
+        print(f"  [2] 随机重置安全后缀 (当前: {cfg.get('secret_path', '')})")
         print("  [3] 返回主菜单")
         print("=======================================================")
         print("请直接输入数字键 [1-3] 快速执行：", end="", flush=True)
@@ -409,16 +427,13 @@ def configure_web():
             break
         elif key == '2':
             print("\033[H\033[J", end="")
-            new_path = input("请输入新的网页安全登录后缀 (不可为空, 建议使用随机字母数字): ").strip()
-            if new_path:
-                cfg['secret_path'] = new_path
-                save_ui_cfg(cfg)
-                print(f"安全登录后缀已更新为: {new_path}")
-                print(f"新的访问路径为: http://{cfg['host']}:{cfg['port']}/{new_path}/")
-                ask_restart()
-            else:
-                print("输入为空，未作任何修改。")
-                time.sleep(1.5)
+            new_path = generate_random_suffix()
+            cfg['secret_path'] = new_path
+            save_ui_cfg(cfg)
+            print("安全登录后缀已随机重置成功！")
+            print(f"您的全新安全登录后缀为: {new_path}")
+            print(f"新的访问路径为: http://{cfg['host']}:{cfg['port']}/{new_path}/")
+            ask_restart()
             break
         elif key == '3' or key == 'q' or key == '\x03':
             break
@@ -456,37 +471,22 @@ def configure_password():
         curr_pwd = cfg.get('password', '')
         masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
         print(f"当前管理密码为: {masked_pwd}")
-        print("  [1] 随机重置密码 (12位随机数字，自动保存)")
-        print("  [2] 自定义管理密码")
-        print("  [3] 返回主菜单")
+        print("  [1] 随机重置密码 (12位数字+字母+符号)")
+        print("  [2] 返回主菜单")
         print("=======================================================")
-        print("请直接输入数字键 [1-3] 快速执行：", end="", flush=True)
+        print("请直接输入数字键 [1-2] 快速执行：", end="", flush=True)
         
         key = getch()
         if key == '1':
             print("\033[H\033[J", end="")
-            import random
-            new_pwd = "".join(random.choices("0123456789", k=12))
+            new_pwd = generate_random_password()
             cfg['password'] = new_pwd
             save_ui_cfg(cfg)
             print("密码重置成功！")
             print(f"您的全新12位安全密码为: {new_pwd}")
             print("此密码已保存在本地，不需要重启服务，刷新浏览器即可登录。")
             input("\n按任意键返回密码菜单...")
-        elif key == '2':
-            print("\033[H\033[J", end="")
-            new_pwd = input("请输入自定义管理密码 (不可为空): ").strip()
-            if new_pwd:
-                cfg['password'] = new_pwd
-                save_ui_cfg(cfg)
-                print("密码更新成功！")
-                print(f"新的管理密码为: {new_pwd}")
-                print("刷新浏览器即可使用新密码登录。")
-                input("\n按任意键返回密码菜单...")
-            else:
-                print("输入为空，未作任何修改。")
-                time.sleep(1.5)
-        elif key == '3' or key == 'q' or key == '\x03':
+        elif key == '2' or key == 'q' or key == '\x03':
             break
 
 def getch():

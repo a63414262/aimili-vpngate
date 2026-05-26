@@ -79,7 +79,19 @@ import hashlib
 import random
 
 def generate_random_password() -> str:
-    return "".join(random.choices("0123456789", k=12))
+    import string
+    # Safe symbols: avoid quotes or backslashes to avoid shell escaping issues
+    symbols = "!@#$%^&*"
+    chars = string.ascii_letters + string.digits + symbols
+    while True:
+        pwd = "".join(random.choices(chars, k=12))
+        # Ensure it contains at least one lowercase, one uppercase, one digit, and one symbol
+        has_lower = any(c.islower() for c in pwd)
+        has_upper = any(c.isupper() for c in pwd)
+        has_digit = any(c.isdigit() for c in pwd)
+        has_symbol = any(c in symbols for c in pwd)
+        if has_lower and has_upper and has_digit and has_symbol:
+            return pwd
 
 def load_ui_config() -> dict[str, Any]:
     auth_file = DATA_DIR / "ui_auth.json"
@@ -713,6 +725,7 @@ def connect_node(node_id: str) -> str:
             print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
             return "Already connecting"
         is_connecting = True
+        set_state(active_openvpn_node_id=node_id, is_connecting=True, active_node_latency="测试中...", last_check_message=f"Connecting to {node_id}")
         
     try:
         log_to_json("INFO", "VPN", f"开始连接节点: {node_id}")
@@ -742,6 +755,7 @@ def connect_node(node_id: str) -> str:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
+            set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
             raise RuntimeError(message)
             
         active_openvpn_process = process
@@ -766,8 +780,8 @@ def connect_node(node_id: str) -> str:
             if item["active"]:
                 item["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
         write_json(NODES_FILE, nodes)
-        latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "连接超时"
-        set_state(active_openvpn_node_id=node_id, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
+        latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
+        set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         return f"Connected {node_id}"
     finally:
@@ -2589,6 +2603,22 @@ $("btn_test_proxy").onclick = async () => {
     btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 测试代理`;
   }
 };
+
+// 页面加载时自动初始化数据
+load();
+
+// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
+setInterval(async () => {
+  if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
+    try {
+      const r = await fetch("./api/nodes");
+      const d = await r.json();
+      nodes = d.nodes || [];
+      state = d.state || {};
+      render();
+    } catch(e) {}
+  }
+}, 10000);
 </script>
 </body></html>"""
 
