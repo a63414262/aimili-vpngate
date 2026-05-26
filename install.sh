@@ -310,12 +310,13 @@ def print_status():
     bold = "\033[1m"
     yellow = "\033[1;33m"
     
-    gateway_status = f"{green}[已激活]{reset}" if gateway_ok else f"{red}[未启动]{reset}"
     backend_status = f"{green}[已激活] (PID: {pid}){reset}" if (service_ok and pid) else f"{red}[未启动]{reset}"
     
     if is_connecting:
+        gateway_status = f"{yellow}[切换中...]{reset}"
         openvpn_status = f"{yellow}[{state.get('active_node_latency') or '连接中'}...]{reset}"
     else:
+        gateway_status = f"{green}[已激活]{reset}" if gateway_ok else f"{red}[未启动]{reset}"
         openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
     
     print("=======================================================")
@@ -526,6 +527,26 @@ def getch():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return ch
 
+def getch_timeout(timeout=1.0):
+    import select
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if r:
+            return sys.stdin.read(1)
+        return None
+    try:
+        tty.setraw(fd)
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if r:
+            ch = sys.stdin.read(1)
+            return ch
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
 def main():
     if os.geteuid() != 0:
         print("错误: 必须以 root 权限运行此命令。")
@@ -589,9 +610,12 @@ def main():
         print("请直接输入数字键 [0-9] 快速选择执行：", end="", flush=True)
         
         try:
-            key = getch()
+            key = getch_timeout(1.0)
         except KeyboardInterrupt:
             break
+            
+        if key is None:
+            continue
             
         if key == '\x03':
             break

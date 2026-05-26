@@ -25,7 +25,13 @@ logs/
 .vscode/
 .idea/
 .gemini/
+.cursorrules
+
 
 # Scratch and test files containing credentials
 scratch/
 *不要上传到GITHUB*
+
+# Local analysis and doc files
+AimiliVPN_Analysis_ZH.md
+

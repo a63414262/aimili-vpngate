@@ -2313,18 +2313,44 @@ function render(){
   const pBadge = $("proxy_status_badge");
   const pIpVal = $("proxy_ip_val");
   const pLatVal = $("proxy_latency_val");
-  if (state.proxy_ok !== undefined) {
-    if (state.proxy_ok) {
-      pBadge.className = "badge available";
-      pBadge.textContent = "可用";
-      pIpVal.textContent = state.proxy_ip || "-";
-      const latencyClass = getLatencyClass(state.proxy_latency_ms);
-      pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;
+  const pBtn = $("btn_test_proxy");
+  
+  if (state.is_connecting) {
+    pBadge.className = "badge";
+    pBadge.style.background = "rgba(245, 158, 11, 0.15)";
+    pBadge.style.color = "#f59e0b";
+    pBadge.style.borderColor = "rgba(245, 158, 11, 0.3)";
+    pBadge.innerHTML = `<span class="badge-pulse" style="background: #f59e0b;"></span>切换中...`;
+    pIpVal.textContent = "正在切换...";
+    pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">等待隧道建立...</span>`;
+    pBtn.disabled = true;
+    pBtn.style.opacity = "0.5";
+    pBtn.style.cursor = "not-allowed";
+  } else {
+    pBtn.disabled = false;
+    pBtn.style.opacity = "";
+    pBtn.style.cursor = "";
+    pBadge.style.background = "";
+    pBadge.style.color = "";
+    pBadge.style.borderColor = "";
+    if (state.proxy_ok !== undefined) {
+      if (state.proxy_ok) {
+        pBadge.className = "badge available";
+        pBadge.textContent = "可用";
+        pIpVal.textContent = state.proxy_ip || "-";
+        const latencyClass = getLatencyClass(state.proxy_latency_ms);
+        pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;
+      } else {
+        pBadge.className = "badge unavailable";
+        pBadge.textContent = "不可用";
+        pIpVal.textContent = "-";
+        pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;" title="${esc(state.proxy_error)}">${esc(state.proxy_error || "连接失败")}</span>`;
+      }
     } else {
-      pBadge.className = "badge unavailable";
-      pBadge.textContent = "不可用";
+      pBadge.className = "badge not_checked";
+      pBadge.textContent = "未检测";
       pIpVal.textContent = "-";
-      pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;" title="${esc(state.proxy_error)}">${esc(state.proxy_error || "连接失败")}</span>`;
+      pLatVal.innerHTML = "";
     }
   }
 

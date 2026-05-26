@@ -38,3 +38,5 @@ You must strictly adhere to the following rules regarding environment boundaries
   所有的仓库上传和 git 推送必须由用户手动审查并执行。
 - **Permitted Git Actions / 允许的 Git 操作**: Local operations only (e.g., `git diff`, `git status`, `git add`, `git commit` on local environment). Do not perform any remote push.
   仅限本地操作（例如在本地环境执行 `git diff`、`git status`、`git add`、`git commit`）。切勿执行任何远程推送（push）。
+
+  工作流程和工作汇报，请用简体中文！
