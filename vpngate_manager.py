@@ -561,6 +561,21 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     return available_nodes + untested_nodes + unavailable_nodes
 
+active_test_indexes = set()
+test_indexes_lock = threading.Lock()
+
+def get_free_test_index() -> int:
+    with test_indexes_lock:
+        for idx in range(2, 100):
+            if idx not in active_test_indexes:
+                active_test_indexes.add(idx)
+                return idx
+        return 99
+
+def release_test_index(idx: int) -> None:
+    with test_indexes_lock:
+        active_test_indexes.discard(idx)
+
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -581,7 +596,12 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
     latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-    ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev="tun1")
+    
+    idx = get_free_test_index()
+    try:
+        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+    finally:
+        release_test_index(idx)
     
     try:
         if temp_path.exists():
@@ -2054,11 +2074,7 @@ INDEX_HTML = r"""<!doctype html>
 let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
 const pageSize = 11;
-let batchCountdown = 0;
-let batchInterval = null;
 let currentPageNodes = [];
-let testingNodesTimeouts = {};
-let testingTimer = null;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -2194,39 +2210,12 @@ function getFilteredNodes() {
   });
 }
 
-function startTestingTimer() {
-  if (testingTimer) return;
-  testingTimer = setInterval(() => {
-    let active = false;
-    for (const id in testingNodesTimeouts) {
-      if (testingNodesTimeouts[id] > 0) {
-        testingNodesTimeouts[id]--;
-        active = true;
-      } else {
-        delete testingNodesTimeouts[id];
-      }
+function stableSortNodes() {
+  nodes.sort((a, b) => {
+    if ((b.score || 0) !== (a.score || 0)) {
+      return (b.score || 0) - (a.score || 0);
     }
-    if (!active) {
-      clearInterval(testingTimer);
-      testingTimer = null;
-    }
-    renderTestingStates();
-  }, 1000);
-}
-
-function renderTestingStates() {
-  document.querySelectorAll(".test-btn[data-node-id]").forEach(btn => {
-    const id = btn.getAttribute("data-node-id");
-    if (testingNodesTimeouts[id] !== undefined) {
-      btn.disabled = true;
-      btn.textContent = `检测中 (${testingNodesTimeouts[id]}s)`;
-    } else if (testingNodeIds.has(id)) {
-      btn.disabled = true;
-      btn.textContent = `同步中...`;
-    } else {
-      btn.disabled = false;
-      btn.textContent = `检测`;
-    }
+    return a.id.localeCompare(b.id);
   });
 }
 
@@ -2386,8 +2375,8 @@ function render(){
       const displayLocation = n.location || translateCountry(n.country) || "-";
       
       const isTesting = testingNodeIds.has(n.id);
-      const remainingSeconds = testingNodesTimeouts[n.id];
-      const testBtnText = isTesting ? (remainingSeconds !== undefined ? `检测中 (${remainingSeconds}s)` : '同步中...') : '检测';
+      const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
+      const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
@@ -2446,9 +2435,7 @@ $("btn_last_page").onclick = () => {
 async function testNode(btn, id, event){
   if (event) event.stopPropagation();
   testingNodeIds.add(id);
-  testingNodesTimeouts[id] = 35; // 35s default timeout
-  startTestingTimer();
-  renderTestingStates();
+  render();
   
   try {
     const response = await fetch("./api/test_node", {
@@ -2466,8 +2453,6 @@ async function testNode(btn, id, event){
   } catch (e) {
   } finally {
     testingNodeIds.delete(id);
-    delete testingNodesTimeouts[id];
-    renderTestingStates();
     render();
   }
 }
@@ -2482,6 +2467,7 @@ function startConnectionPolling() {
       const data = await resp.json();
       nodes = data.nodes || [];
       state = data.state || {};
+      stableSortNodes();
       render();
       
       if (!state.is_connecting) {
@@ -2563,56 +2549,41 @@ $("btn_batch_test").onclick = async () => {
     return;
   }
   
-  const nodeIds = pageNodes.map(n => n.id);
   const btn = $("btn_batch_test");
   btn.disabled = true;
+  btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width: 14px; height: 14px; display: inline-block; margin-right: 6px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>测试中...`;
   
-  nodeIds.forEach(id => {
-    testingNodeIds.add(id);
-    testingNodesTimeouts[id] = 35;
-  });
-  startTestingTimer();
-  renderTestingStates();
+  pageNodes.forEach(n => testingNodeIds.add(n.id));
+  render();
   
-  let countdown = 35;
-  btn.innerHTML = `<span class="badge-pulse"></span>测试中... (${countdown}秒)`;
-  
-  const batchInterval = setInterval(() => {
-    countdown--;
-    if (countdown > 0) {
-      btn.innerHTML = `<span class="badge-pulse"></span>测试中... (${countdown}秒)`;
-    } else {
-      btn.innerHTML = `正在同步结果...`;
-      clearInterval(batchInterval);
+  const testPromises = pageNodes.map(async (n) => {
+    const id = n.id;
+    try {
+      const response = await fetch("./api/test_node", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      });
+      const result = await response.json();
+      if (result.ok && result.node) {
+        const idx = nodes.findIndex(item => item.id === id);
+        if (idx !== -1) {
+          nodes[idx] = result.node;
+        }
+      }
+    } catch (e) {
+    } finally {
+      testingNodeIds.delete(id);
+      render();
     }
-  }, 1000);
+  });
   
   try {
-    const response = await fetch("./api/test_nodes", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: nodeIds })
-    });
-    const result = await response.json();
-    if (result.ok && result.nodes) {
-      result.nodes.forEach(updatedNode => {
-        const idx = nodes.findIndex(n => n.id === updatedNode.id);
-        if (idx !== -1) {
-          nodes[idx] = { ...nodes[idx], ...updatedNode };
-        }
-      });
-    }
+    await Promise.all(testPromises);
   } catch (e) {
   } finally {
-    clearInterval(batchInterval);
-    nodeIds.forEach(id => {
-      testingNodeIds.delete(id);
-      delete testingNodesTimeouts[id];
-    });
     btn.disabled = false;
     btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 批量测试本页`;
-    renderTestingStates();
-    render();
   }
 };
 
@@ -2622,18 +2593,7 @@ async function load(){
   nodes=d.nodes||[]; 
   state=d.state||{}; 
   
-  nodes.sort((a, b) => {
-    const aAvail = a.probe_status === "available" || a.active;
-    const bAvail = b.probe_status === "available" || b.active;
-    if (aAvail && !bAvail) return -1;
-    if (!aAvail && bAvail) return 1;
-    
-    if (aAvail && bAvail) {
-      return (a.latency_ms || 999999) - (b.latency_ms || 999999);
-    }
-    return (b.score || 0) - (a.score || 0);
-  });
-  
+  stableSortNodes();
   updateCountryFilter();
   render();
 
@@ -2712,6 +2672,7 @@ setInterval(async () => {
       const d = await r.json();
       nodes = d.nodes || [];
       state = d.state || {};
+      stableSortNodes();
       render();
     } catch(e) {}
   }
