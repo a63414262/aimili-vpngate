@@ -533,15 +533,24 @@ def getch_timeout(timeout=1.0):
     try:
         old_settings = termios.tcgetattr(fd)
     except termios.error:
-        r, _, _ = select.select([sys.stdin], [], [], timeout)
-        if r:
-            return sys.stdin.read(1)
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], timeout)
+            if r:
+                ch = sys.stdin.read(1)
+                if not ch:
+                    time.sleep(timeout)
+                    return None
+                return ch
+        except Exception:
+            time.sleep(timeout)
         return None
     try:
         tty.setraw(fd)
         r, _, _ = select.select([sys.stdin], [], [], timeout)
         if r:
             ch = sys.stdin.read(1)
+            if not ch:
+                return None
             return ch
         return None
     finally:
@@ -561,7 +570,14 @@ def main():
         elif cmd == "restart":
             restart_service()
         elif cmd == "status":
-            print_status()
+            try:
+                while True:
+                    print("\033[H\033[J", end="")
+                    print_status()
+                    print("\n提示: 正在实时监控状态，每 2 秒自动刷新。按 Ctrl+C 退出...")
+                    time.sleep(2)
+            except KeyboardInterrupt:
+                pass
         elif cmd == "logs":
             show_logs()
         elif cmd == "update":

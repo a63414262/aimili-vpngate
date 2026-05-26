@@ -2320,9 +2320,9 @@ function render(){
     pBadge.style.background = "rgba(245, 158, 11, 0.15)";
     pBadge.style.color = "#f59e0b";
     pBadge.style.borderColor = "rgba(245, 158, 11, 0.3)";
-    pBadge.innerHTML = `<span class="badge-pulse" style="background: #f59e0b;"></span>切换中...`;
-    pIpVal.textContent = "正在切换...";
-    pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">等待隧道建立...</span>`;
+    pBadge.innerHTML = `<span class="badge-pulse" style="background: #f59e0b;"></span>正在连接`;
+    pIpVal.textContent = state.active_node_latency || "正在连接...";
+    pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">${esc(state.last_check_message || "正在与 VPN 节点建立加密隧道，请稍候...")}</span>`;
     pBtn.disabled = true;
     pBtn.style.opacity = "0.5";
     pBtn.style.cursor = "not-allowed";
@@ -2466,13 +2466,7 @@ async function testNode(btn, id, event){
 
 let pollInterval = null;
 
-async function connectNode(id){
-  state.is_connecting = true;
-  state.active_openvpn_node_id = id;
-  state.active_node_latency = "正在连接";
-  state.last_check_message = "正在发送连接请求...";
-  render();
-  
+function startConnectionPolling() {
   if (pollInterval) clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
     try {
@@ -2496,6 +2490,16 @@ async function connectNode(id){
       location.reload();
     }
   }, 1000);
+}
+
+async function connectNode(id){
+  state.is_connecting = true;
+  state.active_openvpn_node_id = id;
+  state.active_node_latency = "正在连接";
+  state.last_check_message = "正在发送连接请求...";
+  render();
+  
+  startConnectionPolling();
   
   try {
     const r = await fetch("./api/connect",{
@@ -2624,6 +2628,10 @@ async function load(){
   
   updateCountryFilter();
   render();
+
+  if (state.is_connecting) {
+    startConnectionPolling();
+  }
 }
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
