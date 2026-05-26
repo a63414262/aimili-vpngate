@@ -2526,13 +2526,21 @@ function render(){
         pBadge.className = "badge unavailable";
         pBadge.textContent = "不可用";
         pIpVal.textContent = "-";
-        pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;" title="${esc(state.proxy_error)}">${esc(state.proxy_error || "连接失败")}</span>`;
+        if (state.last_check_message) {
+          pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">${esc(state.last_check_message)}</span>`;
+        } else {
+          pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;" title="${esc(state.proxy_error)}">${esc(state.proxy_error || "连接失败")}</span>`;
+        }
       }
     } else {
       pBadge.className = "badge not_checked";
       pBadge.textContent = "未检测";
       pIpVal.textContent = "-";
-      pLatVal.innerHTML = "";
+      if (state.last_check_message) {
+        pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">${esc(state.last_check_message)}</span>`;
+      } else {
+        pLatVal.innerHTML = "";
+      }
     }
   }
 
