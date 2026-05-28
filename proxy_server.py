@@ -22,7 +22,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
-def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+def create_connection(address: tuple[str, int], bind_interface: str, timeout: float = 20) -> socket.socket:
     host, port = address
     err = None
     for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
@@ -31,7 +31,8 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            if bind_interface:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, bind_interface.encode('utf-8'))
             sock.connect(sa)
             return sock
         except OSError as e:
@@ -56,7 +57,7 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes) -> None:
+def socks5_client(client: socket.socket, first_byte: bytes, bind_interface: str) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
@@ -76,7 +77,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             client.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
-        upstream = create_connection((host, port), timeout=20)
+        upstream = create_connection((host, port), bind_interface, timeout=20)
         client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         relay(client, upstream)
     finally:
@@ -93,7 +94,7 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes) -> None:
+def http_client(client: socket.socket, first_byte: bytes, bind_interface: str) -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -103,7 +104,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if method.upper() == "CONNECT":
             host, _, port_text = target.partition(":")
             port = parse_int(port_text) or 443
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), bind_interface, timeout=20)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if rest:
                 upstream.sendall(rest)
@@ -118,7 +119,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:"))]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
-        upstream = create_connection((parsed.hostname, port), timeout=20)
+        upstream = create_connection((parsed.hostname, port), bind_interface, timeout=20)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception:
@@ -131,27 +132,27 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+def proxy_client(client: socket.socket, address: tuple[str, int], bind_interface: str) -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first)
+            socks5_client(client, first, bind_interface)
         else:
-            http_client(client, first)
+            http_client(client, first, bind_interface)
     except Exception:
         try:
             client.close()
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int) -> None:
+def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> None:
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(256)
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
+        print(f"HTTP/SOCKS5 proxy listening on {host}:{port} -> bounded to {bind_interface}", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {e}", flush=True)
         return
@@ -159,7 +160,7 @@ def start_proxy_server(host: str, port: int) -> None:
     while True:
         try:
             client, address = server.accept()
-            threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
+            threading.Thread(target=proxy_client, args=(client, address, bind_interface), daemon=True).start()
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)
